@@ -1,0 +1,13 @@
+[
+  {
+    "_comment": "Add your own ISOs here. Remove this example entry before running.",
+    "Name":    "my-custom-os.iso",
+    "Alias":   "My Custom OS (Example)",
+    "Folder":  "Custom",
+    "SizeMB":  3000,
+    "Urls": [
+      "https://example.com/path/to/my-custom-os.iso",
+      "https://mirror.example.com/my-custom-os.iso"
+    ]
+  }
+]

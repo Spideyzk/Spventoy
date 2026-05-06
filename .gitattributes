@@ -1,0 +1,27 @@
+# Default: let git handle line endings automatically
+* text=auto
+
+# Force LF for shell scripts — they break on Linux/macOS with CRLF
+*.sh   text eol=lf
+*.bash text eol=lf
+
+# PowerShell scripts: tolerant of either, prefer CRLF on Windows
+*.ps1  text eol=crlf
+*.psm1 text eol=crlf
+*.psd1 text eol=crlf
+
+# Web / config files: LF (cross-platform)
+*.json text eol=lf
+*.md   text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+
+# Binary files (just in case)
+*.iso  binary
+*.img  binary
+*.zip  binary
+*.tar  binary
+*.gz   binary
+*.png  binary
+*.jpg  binary
+*.ico  binary

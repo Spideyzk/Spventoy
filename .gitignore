@@ -1,0 +1,55 @@
+# ── ISO files & cache ────────────────────────────────────────────────────────
+*.iso
+*.iso.zip
+*.img
+*.img.gz
+*_cache/
+isos/
+cache/
+downloads/
+
+# ── Ventoy artifacts (downloaded by the script at runtime) ──────────────────
+ventoy/
+ventoy-*/
+ventoy-*.zip
+ventoy-*.tar.gz
+Ventoy2Disk.exe
+ventoy.json
+
+# ── Persistence images ──────────────────────────────────────────────────────
+persistence.dat
+persistence.img
+persistence-*.dat
+
+# ── Backup / work-in-progress files ─────────────────────────────────────────
+*.bak
+*~
+*.swp
+*.tmp
+_*.ps1
+_*.sh
+
+# ── User-specific custom ISO list ───────────────────────────────────────────
+# Leave the example committed; ignore local overrides.
+custom-isos.local.json
+my-custom-isos.json
+
+# ── Logs ────────────────────────────────────────────────────────────────────
+*.log
+*.log.*
+
+# ── OS junk ─────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+desktop.ini
+ehthumbs.db
+$RECYCLE.BIN/
+.Spotlight-V100
+.Trashes
+
+# ── Editors / IDEs ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.code-workspace
+*.sublime-*
+.history/
