@@ -134,7 +134,7 @@ $LANG = @{
         UsbPromptLin   = 'Ventoy USB mount point (e.g. /media/user/Ventoy, or ENTER to abort): '
         UsbDevPrompt   = 'Block device for Ventoy (e.g. /dev/sdb, or ENTER to skip install): '
         UsbNoAccess    = 'Path {0} not found or not accessible.'
-        VentoyOpen     = 'ENTER to open Ventoy2Disk  (CTRL+C if already installed)'
+        VentoyOpen     = 'Open Ventoy2Disk now? [Y/n, ENTER=Y]: '
         VentoyOpenLin  = 'Block device to install Ventoy on (e.g. /dev/sdb, ENTER to skip): '
         VentoyMissing  = 'Ventoy installer not found. Download manually and rerun with -SkipVentoyInstall'
         VentoyFallback = 'GitHub API unreachable. Falling back to Ventoy v1.1.11'
@@ -175,6 +175,7 @@ $LANG = @{
         ModeDirectOk   = 'Mode: DIRECT to USB (downloads written straight to USB)'
         ModeCacheOk    = 'Mode: CACHE + COPY (downloads cached, then copied to USB)'
         DownloadingDirect = 'Downloading directly to USB...'
+        WorkDirOk      = 'Work dir: {0}'
     }
     es = @{
         LangAsk        = 'Select language / Selecciona idioma [en/es, ENTER=en]: '
@@ -209,7 +210,7 @@ $LANG = @{
         UsbPromptLin   = 'Punto de montaje del USB Ventoy (ej. /media/user/Ventoy, o ENTER para abortar): '
         UsbDevPrompt   = 'Dispositivo de bloque para Ventoy (ej. /dev/sdb, o ENTER para saltar instalacion): '
         UsbNoAccess    = 'La ruta {0} no existe o no es accesible.'
-        VentoyOpen     = 'ENTER para abrir Ventoy2Disk  (CTRL+C si ya esta instalado)'
+        VentoyOpen     = '¿Abrir Ventoy2Disk ahora? [S/n, ENTER=S]: '
         VentoyOpenLin  = 'Dispositivo donde instalar Ventoy (ej. /dev/sdb, ENTER para saltar): '
         VentoyMissing  = 'No encuentro el instalador Ventoy. Descargalo manualmente y relanza con -SkipVentoyInstall'
         VentoyFallback = 'GitHub API no responde. Usando Ventoy v1.1.11'
@@ -250,6 +251,7 @@ $LANG = @{
         ModeDirectOk   = 'Modo: DIRECTO al USB (las descargas van directamente al USB)'
         ModeCacheOk   = 'Modo: CACHE + COPIA (descarga al cache y luego copia al USB)'
         DownloadingDirect = 'Descargando directo al USB...'
+        WorkDirOk      = 'Directorio temporal: {0}'
     }
 }
 $L = $null  # set after language selection
@@ -277,7 +279,12 @@ function Write-Banner {
 
 function Write-Config {
     Write-Host ("  USB Title:    {0}" -f $script:Title) -ForegroundColor DarkGray
-    Write-Host ("  Cache:        {0}" -f $DownloadDir)  -ForegroundColor DarkGray
+    if ($script:UseDirectMode) {
+        Write-Host ("  Mode:         Direct to USB") -ForegroundColor DarkGray
+    } else {
+        Write-Host ("  Mode:         Cache + copy") -ForegroundColor DarkGray
+        Write-Host ("  Cache:        {0}" -f $DownloadDir)  -ForegroundColor DarkGray
+    }
     Write-Host ("  USB:          {0}" -f $(if ($UsbDriveLetter) {"${UsbDriveLetter}:"} else {'(autodetect)'})) -ForegroundColor DarkGray
     Write-Host ("  Persistence:  {0}" -f $(if ($SkipPersistence) {'NO'} else {"$PersistenceSizeMB MB"})) -ForegroundColor DarkGray
     Write-Host ""
@@ -1703,13 +1710,20 @@ if ($DirectToUSB) {
 }
 if ($script:UseDirectMode) { Write-Ok $L.ModeDirectOk } else { Write-Ok $L.ModeCacheOk }
 
-# --- Download directory (still used for Ventoy installer, Fido, zip extraction) ---
+# --- Working / cache directory ---
+# In direct mode this is just a small temp area for the Ventoy installer and zip
+# extraction (~100 MB). In cache mode it's the actual ISO cache (large).
 if ([string]::IsNullOrWhiteSpace($DownloadDir)) {
-    $defaultDir = if ($onLinux -or $onMac) { "$HOME/${Title}_cache" } else { "$env:USERPROFILE\${Title}_cache" }
-    Write-Host ""
-    Write-Host ("  " + ($L.DirAsk -f 40)) -ForegroundColor Cyan
-    $inp        = Read-Host ($L.DirRead -f $defaultDir)
-    $DownloadDir = if ([string]::IsNullOrWhiteSpace($inp)) { $defaultDir } else { $inp.Trim() }
+    if ($script:UseDirectMode) {
+        $tempBase = if ($onLinux -or $onMac) { '/tmp' } else { $env:TEMP }
+        $DownloadDir = Join-Path $tempBase "spventoy_$themeSlug"
+    } else {
+        $defaultDir = if ($onLinux -or $onMac) { "$HOME/${Title}_cache" } else { "$env:USERPROFILE\${Title}_cache" }
+        Write-Host ""
+        Write-Host ("  " + ($L.DirAsk -f 40)) -ForegroundColor Cyan
+        $inp        = Read-Host ($L.DirRead -f $defaultDir)
+        $DownloadDir = if ([string]::IsNullOrWhiteSpace($inp)) { $defaultDir } else { $inp.Trim() }
+    }
 }
 
 # --- Persistence ---
@@ -1731,10 +1745,13 @@ if (-not $SkipPersistence.IsPresent) {
     }
 }
 
-$freeGB = Get-DriveFreeGB $DownloadDir
-if ($freeGB) {
-    Write-Host ("  " + ($L.DirFree -f "$freeGB GB")) -ForegroundColor DarkGray
-    if ($freeGB -lt 15) { Write-Warn2 ($L.DirWarn -f 15) }
+# Free-space info: only relevant in cache mode (direct mode uses %TEMP%, ~100 MB max).
+if (-not $script:UseDirectMode) {
+    $freeGB = Get-DriveFreeGB $DownloadDir
+    if ($freeGB) {
+        Write-Host ("  " + ($L.DirFree -f "$freeGB GB")) -ForegroundColor DarkGray
+        if ($freeGB -lt 15) { Write-Warn2 ($L.DirWarn -f 15) }
+    }
 }
 
 Write-Banner
@@ -1745,7 +1762,9 @@ try {
     if (-not (Test-Path $DownloadDir)) {
         New-Item -ItemType Directory -Path $DownloadDir -Force | Out-Null
     }
-    Write-Ok ($L.CacheOk -f $DownloadDir)
+    if (-not $script:UseDirectMode) {
+        Write-Ok ($L.CacheOk -f $DownloadDir)
+    }
 } catch {
     Write-Err "Cannot create $DownloadDir : $($_.Exception.Message)"
     Read-Host "ENTER"; exit 1
@@ -1834,9 +1853,13 @@ if (-not $SkipVentoyInstall) {
             Write-Err $L.VentoyMissing
         } else {
             Write-Ok "Found: $exe"
-            Read-Host $L.VentoyOpen
-            try { Start-Process -FilePath $exe -Wait; Write-Ok "Done" }
-            catch { Write-Warn2 $_.Exception.Message }
+            $inp = Read-Host $L.VentoyOpen
+            if ($inp.Trim() -in @('n','N','no','No','NO')) {
+                Write-Info "Skipping Ventoy installer (already installed?)"
+            } else {
+                try { Start-Process -FilePath $exe -Wait; Write-Ok "Done" }
+                catch { Write-Warn2 $_.Exception.Message }
+            }
         }
     }
 } else {

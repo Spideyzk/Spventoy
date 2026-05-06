@@ -914,7 +914,8 @@ ${CY}${BLD}  ══════════════════════�
 
      ${DM}Language  : ${WH}${LANGUAGE}${RST}
      ${DM}Title     : ${WH}${TITLE}${RST}
-     ${DM}Cache dir : ${WH}${DOWNLOAD_DIR}${RST}
+     ${DM}Mode      : ${WH}$( [[ $USE_DIRECT -eq 1 ]] && echo 'Direct to USB' || echo 'Cache + copy' )${RST}
+$( [[ $USE_DIRECT -eq 0 ]] && printf '     %sCache dir : %s%s%s' "${DM}" "${WH}" "${DOWNLOAD_DIR}" "${RST}" )
      ${DM}USB mount : ${WH}${USB_MOUNT:-autodetect}${RST}
 
 EOF
@@ -966,13 +967,20 @@ main() {
         ok "Mode: CACHE + COPY (downloads cached, then copied to USB)"
     fi
 
-    # Download dir (still used for Ventoy installer / tooling even in direct mode)
+    # Working / cache directory.
+    # Direct mode → small temp area for Ventoy installer + zips, no prompt.
+    # Cache mode  → user-chosen ISO cache (large), prompted.
     if [[ -z "$DOWNLOAD_DIR" ]]; then
-        local default_dir="$HOME/${TITLE}_cache"
-        printf "\n  ISO download/cache directory:\n"
-        printf "  Directory [ENTER=%s]: " "$default_dir"
-        read -r inp
-        [[ -z "$inp" ]] && DOWNLOAD_DIR="$default_dir" || DOWNLOAD_DIR="$inp"
+        if [[ $USE_DIRECT -eq 1 ]]; then
+            local theme_slug; theme_slug=$(printf '%s' "$TITLE" | tr -cs 'a-zA-Z0-9_-' '_' | tr '[:upper:]' '[:lower:]')
+            DOWNLOAD_DIR="/tmp/spventoy_${theme_slug}"
+        else
+            local default_dir="$HOME/${TITLE}_cache"
+            printf "\n  ISO download/cache directory:\n"
+            printf "  Directory [ENTER=%s]: " "$default_dir"
+            read -r inp
+            [[ -z "$inp" ]] && DOWNLOAD_DIR="$default_dir" || DOWNLOAD_DIR="$inp"
+        fi
     fi
     mkdir -p "$DOWNLOAD_DIR"
 
