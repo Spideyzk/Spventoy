@@ -1052,24 +1052,64 @@ function Test-Admin {
         [Security.Principal.WindowsBuiltInRole]::Administrator)
 }
 
-# ─── Build subprocess ─────────────────────────────────────────────────────
+# ─── Build subprocess (file-based polling, no async events) ────────────────
 $script:BuildProcess = $null
+$script:BuildTimer   = $null
+$script:BuildLogOut  = $null
+$script:BuildLogErr  = $null
+$script:BuildOutPos  = 0L
+$script:BuildErrPos  = 0L
 
 function Append-Log {
-    param([string]$line, [string]$color = 'Default')
+    param([string]$line)
     if ($null -eq $line) { return }
-    $window.Dispatcher.Invoke([Action]{
-        $txtLog.AppendText($line + "`r`n")
-        $txtLog.ScrollToEnd()
-    })
+    try {
+        $script:txtLog.AppendText($line + "`r`n")
+        $script:txtLog.ScrollToEnd()
+    } catch {}
 }
 
-function Update-Status([string]$key) {
-    $window.Dispatcher.Invoke([Action]{
-        $txtStatus.Text = if ($key -is [string] -and $STRINGS[$script:Lang][$key]) {
-            $STRINGS[$script:Lang][$key]
-        } else { $key }
-    })
+function Read-NewLogContent([string]$path, [ref]$offset) {
+    if (-not (Test-Path $path)) { return '' }
+    try {
+        $fs = [System.IO.File]::Open($path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        try {
+            $size = $fs.Length
+            if ($size -le $offset.Value) { return '' }
+            $fs.Position = $offset.Value
+            $sr = [System.IO.StreamReader]::new($fs)
+            $content = $sr.ReadToEnd()
+            $offset.Value = $size
+            return $content
+        } finally { $fs.Close() }
+    } catch { return '' }
+}
+
+function Finish-Build([int]$code) {
+    if ($script:BuildTimer) {
+        try { $script:BuildTimer.Stop() } catch {}
+        $script:BuildTimer = $null
+    }
+    foreach ($f in @($script:BuildLogOut, $script:BuildLogErr)) {
+        if ($f -and (Test-Path $f)) {
+            try { Remove-Item $f -Force -ErrorAction SilentlyContinue } catch {}
+        }
+    }
+    try {
+        $script:btnStart.IsEnabled = $true
+        $script:btnStop.IsEnabled  = $false
+        $script:cmbDrive.IsEnabled = $true
+        $script:txtTitle.IsEnabled = $true
+        $script:rdoDirect.IsEnabled  = $true
+        $script:rdoCache.IsEnabled   = $true
+        $script:chkPersist.IsEnabled = $true
+        $script:btnRecommended.IsEnabled = $true
+        $script:btnAll.IsEnabled  = $true
+        $script:btnNone.IsEnabled = $true
+        $script:prgOverall.IsIndeterminate = $false
+        $script:prgOverall.Value = if ($code -eq 0) { 100 } else { 0 }
+        $script:txtStatus.Text = if ($code -eq 0) { L 'StatusDone' } elseif ($code -eq -1) { L 'StatusStopped' } else { (L 'StatusFailed') -f $code }
+    } catch {}
 }
 
 function Start-Build {
@@ -1105,16 +1145,19 @@ function Start-Build {
         return
     }
 
-    $aliasArg = ($aliases | ForEach-Object { '"{0}"' -f ($_ -replace '"','`"') }) -join ','
+    # Write the alias list to a temp file (one per line) — passing a string[]
+    # via -File ARGV is unreliable with spaces / quotes / special chars.
+    $aliasFile = Join-Path $env:TEMP "spventoy_aliases_$([Guid]::NewGuid().ToString('N')).txt"
+    Set-Content -LiteralPath $aliasFile -Value $aliases -Encoding UTF8
 
     $argList = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
-        '-File',  "`"$scriptPath`"",
+        '-File',  $scriptPath,
         '-NonInteractive',
         '-Language', $script:Lang,
-        '-Title',   "`"$title`"",
+        '-Title',   $title,
         '-UsbDriveLetter', $drive,
-        '-SelectedIsoAliases', $aliasArg
+        '-SelectedIsoAliasesFile', $aliasFile
     )
     if ($rdoDirect.IsChecked) { $argList += '-DirectToUSB' } else { $argList += '-UseCache' }
     if (-not $chkPersist.IsChecked) { $argList += '-SkipPersistence' }
@@ -1135,7 +1178,7 @@ function Start-Build {
             $obj | Add-Member -NotePropertyName $k -NotePropertyValue $script:LocalPaths[$k]
         }
         ($obj | ConvertTo-Json -Depth 4) | Set-Content -Path $localTmp -Encoding UTF8
-        $argList += @('-LocalIsoPathsFile', "`"$localTmp`"")
+        $argList += @('-LocalIsoPathsFile', $localTmp)
     }
 
     # Switch UI to "running" state
@@ -1153,7 +1196,7 @@ function Start-Build {
     $btnAll.IsEnabled     = $false
     $btnNone.IsEnabled    = $false
     $prgOverall.IsIndeterminate = $true
-    Update-Status 'StatusRunning'
+    $txtStatus.Text = L 'StatusRunning'
 
     Append-Log "Spventoy GUI launching build..."
     Append-Log "  Title:    $title"
@@ -1167,65 +1210,63 @@ function Start-Build {
     $exe = (Get-Command pwsh.exe -ErrorAction SilentlyContinue)
     if ($exe) { $exe = $exe.Source } else { $exe = 'powershell.exe' }
 
-    $psi = New-Object System.Diagnostics.ProcessStartInfo
-    $psi.FileName  = $exe
-    $psi.Arguments = ($argList -join ' ')
-    $psi.UseShellExecute        = $false
-    $psi.RedirectStandardOutput = $true
-    $psi.RedirectStandardError  = $true
-    $psi.CreateNoWindow         = $true
-    $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
-    $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
-    $psi.WorkingDirectory       = $script:AppRoot
+    # Redirect stdout/stderr to temp files; we poll them from a UI-thread timer
+    # so we never have async events / cross-thread Dispatcher.Invoke calls.
+    $guid = [Guid]::NewGuid().ToString('N')
+    $script:BuildLogOut = Join-Path $env:TEMP "spventoy_build_$guid.out.log"
+    $script:BuildLogErr = Join-Path $env:TEMP "spventoy_build_$guid.err.log"
+    $script:BuildOutPos = 0L
+    $script:BuildErrPos = 0L
 
-    $proc = New-Object System.Diagnostics.Process
-    $proc.StartInfo = $psi
-    $proc.EnableRaisingEvents = $true
-
-    # Output handlers
-    $proc.add_OutputDataReceived({
-        param($s, $e)
-        if ($null -ne $e.Data) { Append-Log $e.Data }
-    })
-    $proc.add_ErrorDataReceived({
-        param($s, $e)
-        if ($null -ne $e.Data) { Append-Log "[ERR] $($e.Data)" }
-    })
-    $proc.add_Exited({
-        param($s, $e)
-        $code = $s.ExitCode
-        $window.Dispatcher.Invoke([Action]{
-            $btnStart.IsEnabled = $true
-            $btnStop.IsEnabled  = $false
-            $cmbDrive.IsEnabled = $true
-            $txtTitle.IsEnabled = $true
-            $rdoDirect.IsEnabled= $true
-            $rdoCache.IsEnabled = $true
-            $chkPersist.IsEnabled = $true
-            $btnRecommended.IsEnabled = $true
-            $btnAll.IsEnabled   = $true
-            $btnNone.IsEnabled  = $true
-            $prgOverall.IsIndeterminate = $false
-            $prgOverall.Value = if ($code -eq 0) { 100 } else { 0 }
-            if ($code -eq 0) { $txtStatus.Text = (L 'StatusDone') }
-            else { $txtStatus.Text = ((L 'StatusFailed') -f $code) }
-        })
-    })
-
-    [void]$proc.Start()
-    $proc.BeginOutputReadLine()
-    $proc.BeginErrorReadLine()
+    try {
+        $proc = Start-Process -FilePath $exe -ArgumentList $argList `
+            -RedirectStandardOutput $script:BuildLogOut `
+            -RedirectStandardError  $script:BuildLogErr `
+            -WorkingDirectory $script:AppRoot `
+            -WindowStyle Hidden -PassThru
+    } catch {
+        Append-Log "[ERR] Failed to start subprocess: $($_.Exception.Message)"
+        Finish-Build -1
+        return
+    }
     $script:BuildProcess = $proc
+
+    $script:BuildTimer = New-Object Windows.Threading.DispatcherTimer
+    $script:BuildTimer.Interval = [TimeSpan]::FromMilliseconds(250)
+    $script:BuildTimer.Add_Tick({
+        try {
+            $oRef = [ref]$script:BuildOutPos
+            $eRef = [ref]$script:BuildErrPos
+            $oNew = Read-NewLogContent $script:BuildLogOut $oRef
+            $eNew = Read-NewLogContent $script:BuildLogErr $eRef
+            $script:BuildOutPos = $oRef.Value
+            $script:BuildErrPos = $eRef.Value
+            if ($oNew) { $script:txtLog.AppendText($oNew); $script:txtLog.ScrollToEnd() }
+            if ($eNew) { $script:txtLog.AppendText('[ERR] ' + $eNew); $script:txtLog.ScrollToEnd() }
+
+            if ($script:BuildProcess -and $script:BuildProcess.HasExited) {
+                # Drain any remaining output
+                $oNew = Read-NewLogContent $script:BuildLogOut ([ref]$script:BuildOutPos)
+                $eNew = Read-NewLogContent $script:BuildLogErr ([ref]$script:BuildErrPos)
+                if ($oNew) { $script:txtLog.AppendText($oNew); $script:txtLog.ScrollToEnd() }
+                if ($eNew) { $script:txtLog.AppendText('[ERR] ' + $eNew); $script:txtLog.ScrollToEnd() }
+
+                $code = try { $script:BuildProcess.ExitCode } catch { -1 }
+                Finish-Build $code
+            }
+        } catch {
+            Append-Log "[GUI] Timer error: $($_.Exception.Message)"
+        }
+    })
+    $script:BuildTimer.Start()
 }
 
 function Stop-Build {
     if (-not $script:BuildProcess -or $script:BuildProcess.HasExited) { return }
     $r = [System.Windows.MessageBox]::Show((L 'ConfirmStop'), 'Spventoy', 'YesNo', 'Warning')
     if ($r -ne 'Yes') { return }
-    try {
-        $script:BuildProcess.Kill($true)   # kill subtree
-    } catch {}
-    Update-Status 'StatusStopped'
+    try { $script:BuildProcess.Kill($true) } catch {}
+    # Timer will detect HasExited on next tick and call Finish-Build
 }
 
 # ─── Wire up events ───────────────────────────────────────────────────────

@@ -80,8 +80,22 @@ param(
     [int]$PersistenceSizeMB = 8192,
     [switch]$NonInteractive,
     [string[]]$SelectedIsoAliases,
+    [string]$SelectedIsoAliasesFile,
     [string]$LocalIsoPathsFile
 )
+
+# Load aliases from file if provided. This is the reliable path used by the
+# GUI — passing string[] arrays via PowerShell's -File argv is fragile when
+# the values contain spaces, quotes or special characters.
+if ($SelectedIsoAliasesFile -and (Test-Path $SelectedIsoAliasesFile)) {
+    try {
+        $loaded = Get-Content -LiteralPath $SelectedIsoAliasesFile -Encoding UTF8 |
+            Where-Object { $_ -and -not $_.StartsWith('#') }
+        if ($loaded) { $SelectedIsoAliases = @($loaded) }
+    } catch {
+        Write-Host "Could not read SelectedIsoAliasesFile: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+}
 
 if ($DirectToUSB -and $UseCache) {
     Write-Host "Cannot use both -DirectToUSB and -UseCache. Pick one." -ForegroundColor Red
@@ -336,7 +350,7 @@ function Invoke-SegmentedDownload {
     } catch {}
     $hClient = [System.Net.Http.HttpClient]::new($h)
     $hClient.Timeout = [TimeSpan]::FromMinutes(2)
-    $hClient.MaxResponseContentBufferSize = 17179869184L   # 16 GB
+    try { $hClient.MaxResponseContentBufferSize = 2147483647L } catch {}   # int.MaxValue, ignored if rejected
     [void]$hClient.DefaultRequestHeaders.UserAgent.TryParseAdd('Spventoy/1.0')
 
     $headReq  = [System.Net.Http.HttpRequestMessage]::new('HEAD', $Url)
@@ -374,7 +388,7 @@ function Invoke-SegmentedDownload {
         $h.AllowAutoRedirect = $false
         $c = [System.Net.Http.HttpClient]::new($h)
         $c.Timeout = [TimeSpan]::FromMinutes(60)
-        $c.MaxResponseContentBufferSize = 17179869184L   # 16 GB
+        try { $c.MaxResponseContentBufferSize = 2147483647L } catch {}   # int.MaxValue, ignored if rejected
         [void]$c.DefaultRequestHeaders.UserAgent.TryParseAdd('Spventoy/1.0')
         $rq = [System.Net.Http.HttpRequestMessage]::new('GET', $url)
         $rq.Headers.Range = [System.Net.Http.Headers.RangeHeaderValue]::new([long]$from, [long]$to)
@@ -547,7 +561,7 @@ function Invoke-StreamDownload {
     } catch {}
     $client = [System.Net.Http.HttpClient]::new($handler)
     $client.Timeout = [TimeSpan]::FromMinutes($TimeoutMin)
-    $client.MaxResponseContentBufferSize = 17179869184L   # 16 GB — handle ISOs > 2 GB
+    try { $client.MaxResponseContentBufferSize = 2147483647L } catch {}   # int.MaxValue, ignored if rejected
     [void]$client.DefaultRequestHeaders.UserAgent.TryParseAdd('Spventoy/1.0')
 
     $fs = $null
@@ -945,16 +959,23 @@ function Resolve-FinnixUrls {
 }
 
 function Resolve-MemtestUrls {
+    # MemTest86+ since v8.00 publishes per-architecture builds; we want x86_64.
+    # Filename pattern: mt86plus_<ver>_x86_64.iso.zip
     try {
         $page = Invoke-WebRequest 'https://www.memtest.org/' -UseBasicParsing -TimeoutSec 20
+        if ($page.Content -match 'mt86plus_([\d.]+)_x86_64\.iso\.zip') {
+            $ver = $Matches[1]
+            return @("https://www.memtest.org/download/v$ver/mt86plus_${ver}_x86_64.iso.zip")
+        }
+        # Fallback: older single-arch naming
         if ($page.Content -match 'mt86plus_([\d.]+)\.iso\.zip') {
             $ver = $Matches[1]
             return @("https://www.memtest.org/download/v$ver/mt86plus_$ver.iso.zip")
         }
     } catch {}
     return @(
-        'https://www.memtest.org/download/v7.20/mt86plus_7.20.iso.zip',
-        'https://www.memtest.org/download/v7.00/mt86plus_7.00.iso.zip'
+        'https://www.memtest.org/download/v8.00/mt86plus_8.00_x86_64.iso.zip',
+        'https://www.memtest.org/download/v7.20/mt86plus_7.20.iso.zip'
     )
 }
 
@@ -1378,6 +1399,112 @@ function Get-CustomIsos {
         Write-Warn2 ($script:L.CustomInvalid -f $_.Exception.Message)
         return @()
     }
+}
+
+# ============================================================================
+# URL VALIDATION (parallel HEAD checks)
+# ============================================================================
+function Test-UrlsAliveParallel {
+    # Run HEAD against each URL in parallel runspaces. Returns a hashtable
+    # mapping URL -> $true for URLs that responded with a 2xx/3xx (or 405,
+    # which means HEAD is rejected but the resource exists).
+    param([string[]]$Urls, [int]$TimeoutSec = 6, [int]$MaxParallel = 32)
+
+    $alive = @{}
+    if (-not $Urls -or $Urls.Count -eq 0) { return $alive }
+
+    $rsPool = [runspacefactory]::CreateRunspacePool(1, $MaxParallel)
+    $rsPool.Open()
+    $jobs = @()
+
+    $segScript = {
+        param($url, $tm)
+        try {
+            [Net.ServicePointManager]::SecurityProtocol =
+                [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+        } catch {}
+        try {
+            $req = [System.Net.WebRequest]::Create($url)
+            $req.Method            = 'HEAD'
+            $req.Timeout           = $tm * 1000
+            $req.AllowAutoRedirect = $true
+            $req.UserAgent         = 'Spventoy/1.0'
+            $resp = $req.GetResponse()
+            $code = [int]$resp.StatusCode
+            $resp.Close()
+            return ($code -ge 200 -and $code -lt 400)
+        } catch [System.Net.WebException] {
+            try {
+                $r = $_.Exception.Response
+                if ($r) {
+                    $c = [int]$r.StatusCode
+                    $r.Close()
+                    # 405 = HEAD not allowed but URL exists; 416 = range issue;
+                    # both signal a live endpoint.
+                    return ($c -eq 405 -or $c -eq 416 -or ($c -ge 200 -and $c -lt 400))
+                }
+            } catch {}
+            return $false
+        } catch { return $false }
+    }
+
+    foreach ($u in ($Urls | Select-Object -Unique)) {
+        $ps = [PowerShell]::Create()
+        $ps.RunspacePool = $rsPool
+        [void]$ps.AddScript($segScript)
+        [void]$ps.AddArgument($u).AddArgument($TimeoutSec)
+        $jobs += [pscustomobject]@{ PS = $ps; Handle = $ps.BeginInvoke(); Url = $u }
+    }
+
+    foreach ($j in $jobs) {
+        try {
+            $r = $j.PS.EndInvoke($j.Handle)
+            if ($r -and $r[0]) { $alive[$j.Url] = $true }
+        } catch {}
+        $j.PS.Dispose()
+    }
+    $rsPool.Close()
+    $rsPool.Dispose()
+    return $alive
+}
+
+function Invoke-CatalogUrlValidation {
+    # Filters dead URLs out of every non-manual catalog entry. Logs a summary.
+    param([object[]]$Catalog)
+
+    $allUrls = New-Object System.Collections.Generic.List[string]
+    foreach ($iso in $Catalog) {
+        if ($iso.Manual)        { continue }
+        if ($iso.Fido)          { continue }   # Fido resolves dynamically at download time
+        if ($iso.LocalPath)     { continue }   # local file, skip network check
+        if (-not $iso.Urls)     { continue }
+        foreach ($u in $iso.Urls) { [void]$allUrls.Add($u) }
+    }
+    if ($allUrls.Count -eq 0) { return $Catalog }
+
+    Write-Step "Validating $($allUrls.Count) URL(s) (HEAD checks in parallel)..."
+    $sw = [System.Diagnostics.Stopwatch]::StartNew()
+    $alive = Test-UrlsAliveParallel -Urls $allUrls.ToArray()
+    $sw.Stop()
+
+    $deadIsos = New-Object System.Collections.Generic.List[string]
+    $prunedCount = 0
+    foreach ($iso in $Catalog) {
+        if ($iso.Manual -or $iso.Fido -or $iso.LocalPath -or -not $iso.Urls) { continue }
+        $kept = @($iso.Urls | Where-Object { $alive.ContainsKey($_) })
+        $prunedCount += ($iso.Urls.Count - $kept.Count)
+        if ($kept.Count -eq 0) {
+            [void]$deadIsos.Add($iso.Alias)
+        }
+        $iso.Urls = $kept
+    }
+
+    Write-Ok ("URL check done in {0:N1}s — {1} alive, {2} dead pruned" -f $sw.Elapsed.TotalSeconds, $alive.Count, $prunedCount)
+    if ($deadIsos.Count -gt 0) {
+        Write-Warn2 "$($deadIsos.Count) ISO(s) have ALL URLs dead and will fail if selected:"
+        foreach ($a in $deadIsos) { Write-Info "  - $a" }
+    }
+    return $Catalog
 }
 
 # ============================================================================
@@ -1858,10 +1985,29 @@ $IconSources = @{
 function Get-VentoyJsonContent {
     param([string]$themeSlug, [object[]]$SelectedIsos)
 
-    $aliases = ($SelectedIsos | ForEach-Object {
-        $f = $_.Folder -replace '\\','/'
-        "    { `"image`": `"/ISO/$f/$($_.Name)`", `"alias`": `"$($_.Alias)`" }"
-    }) -join ",`n"
+    # Build the full menu_alias entry list as a single array, then join with
+    # commas — this avoids trailing-comma JSON syntax errors when no ISOs
+    # are selected (Ventoy is very strict about JSON validity).
+    $dirAliases = @(
+        '    { "dir": "/ISO/Linux",         "alias": "Linux Distros" }'
+        '    { "dir": "/ISO/Linux/Debian",  "alias": "  Debian Family" }'
+        '    { "dir": "/ISO/Linux/RHEL",    "alias": "  RHEL Family" }'
+        '    { "dir": "/ISO/Linux/Arch",    "alias": "  Arch Family" }'
+        '    { "dir": "/ISO/Linux/Other",   "alias": "  Other Linux" }'
+        '    { "dir": "/ISO/Security",      "alias": "Pentest & Security" }'
+        '    { "dir": "/ISO/Sysadmin",      "alias": "Sysadmin Tools" }'
+        '    { "dir": "/ISO/Rescue",        "alias": "Rescue & Recovery" }'
+        '    { "dir": "/ISO/Windows",       "alias": "Windows" }'
+        '    { "dir": "/ISO/Custom",        "alias": "Custom ISOs" }'
+    )
+    $isoAliases = @()
+    if ($SelectedIsos) {
+        foreach ($iso in $SelectedIsos) {
+            $f = $iso.Folder -replace '\\','/'
+            $isoAliases += "    { `"image`": `"/ISO/$f/$($iso.Name)`", `"alias`": `"$($iso.Alias)`" }"
+        }
+    }
+    $allAliases = ($dirAliases + $isoAliases) -join ",`r`n"
 
     $kaliIso     = $SelectedIsos | Where-Object { $_.Name -like 'kali*live*' } | Select-Object -First 1
     $persistBlock = ''
@@ -1893,17 +2039,7 @@ function Get-VentoyJsonContent {
     "ventoy_color": "#7c3aed"
   },
 $persistBlock  "menu_alias": [
-    { "dir": "/ISO/Linux",         "alias": "Linux Distros" },
-    { "dir": "/ISO/Linux/Debian",  "alias": "  Debian Family" },
-    { "dir": "/ISO/Linux/RHEL",    "alias": "  RHEL Family" },
-    { "dir": "/ISO/Linux/Arch",    "alias": "  Arch Family" },
-    { "dir": "/ISO/Linux/Other",   "alias": "  Other Linux" },
-    { "dir": "/ISO/Security",      "alias": "Pentest & Security" },
-    { "dir": "/ISO/Sysadmin",      "alias": "Sysadmin Tools" },
-    { "dir": "/ISO/Rescue",        "alias": "Rescue & Recovery" },
-    { "dir": "/ISO/Windows",       "alias": "Windows" },
-    { "dir": "/ISO/Custom",        "alias": "Custom ISOs" },
-$aliases
+$allAliases
   ],
   "menu_class": [
     { "key": "debian",           "class": "debian" },
@@ -2239,12 +2375,16 @@ try {
     }
 } catch {
     Write-Err "Cannot create $DownloadDir : $($_.Exception.Message)"
-    Read-Host $L.PressEnter; exit 1
+    if (-not $NonInteractive) { Read-Host $L.PressEnter }
+    exit 1
 }
 
 # --- Resolve latest versions & build catalog ---
 Write-Step $L.Resolving
 $catalog = @(Get-IsoCatalog) + @(Get-CustomIsos)
+
+# Prune URLs that don't resolve (HEAD checks in parallel)
+$catalog = Invoke-CatalogUrlValidation -Catalog $catalog
 
 # --- Local ISO paths (use already-downloaded files instead of re-downloading) ---
 if ($LocalIsoPathsFile -and (Test-Path $LocalIsoPathsFile)) {
@@ -2440,13 +2580,19 @@ if ($onLinux -or $onMac) {
                     @{N='Size';E={Format-Bytes $_.Size}},
                     @{N='Free';E={Format-Bytes $_.SizeRemaining}}
             $ltr = Read-Host $L.UsbPrompt
-            if ([string]::IsNullOrWhiteSpace($ltr)) { Write-Err "Aborted."; Read-Host $L.PressEnter; exit 1 }
+            if ([string]::IsNullOrWhiteSpace($ltr)) {
+                Write-Err "Aborted."
+                if (-not $NonInteractive) { Read-Host $L.PressEnter }
+                exit 1
+            }
             $usbRoot = $ltr.TrimEnd(':') + ':'
         }
     }
 }
 if (-not (Test-Path $usbRoot)) {
-    Write-Err ($L.UsbNoAccess -f $usbRoot); Read-Host $L.PressEnter; exit 1
+    Write-Err ($L.UsbNoAccess -f $usbRoot)
+    if (-not $NonInteractive) { Read-Host $L.PressEnter }
+    exit 1
 }
 
 $usbFreeGB = Get-DriveFreeGB $usbRoot
@@ -2724,4 +2870,4 @@ try {
 Write-Ok ($L.DoneMsg -f $Title, $usbRoot)
 Write-Info ($L.ManualWin -f $usbRoot)
 Write-Host ""
-Read-Host $L.PressEnter
+if (-not $NonInteractive) { Read-Host $L.PressEnter }
