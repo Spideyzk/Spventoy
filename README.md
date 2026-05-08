@@ -60,15 +60,33 @@ Both download the latest stable versions, verify them, install Ventoy on the USB
 
 > **WARNING:** Ventoy installation **wipes the entire USB drive**. Make sure you have nothing important on it.
 
-### Windows (PowerShell)
+### Windows — easy mode (recommended)
+
+Just double-click **`Run.cmd`**. It self-elevates to Administrator, bypasses PowerShell's ExecutionPolicy and Mark-of-the-Web, and runs the script. No manual setup.
+
+You can also pass parameters through:
+
+```cmd
+Run.cmd -Language en -Title "MYBOOT" -DirectToUSB
+```
+
+### Windows — manual mode (PowerShell)
+
+If you prefer to launch the script directly:
 
 ```powershell
 # 1. Open PowerShell as Administrator
-# 2. Allow script execution for this session
+# 2. Allow script execution for this session (one time per shell)
 Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 
 # 3. Run interactively (the script will prompt for everything)
 .\Build-MultibootUSB.ps1
+```
+
+If the script complains about being "blocked" because it was downloaded from the internet, run once:
+
+```powershell
+Get-ChildItem -Recurse | Unblock-File
 ```
 
 Or with parameters (direct-to-USB, fastest):
@@ -198,7 +216,8 @@ Edit `custom-isos.json` to add ISOs that aren't in the built-in catalog. Format:
 
 ## Troubleshooting
 
-- **"Access denied" on Windows** — the PowerShell window must be elevated (Run as Administrator).
+- **"Cannot load file ... execution of scripts is disabled"** — Windows blocks unsigned PowerShell scripts by default. Use **`Run.cmd`** (it bypasses the policy automatically), or run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` once in your PowerShell session.
+- **"Access denied" on Windows** — the PowerShell window must be elevated (Run as Administrator). `Run.cmd` does this automatically.
 - **Wrong USB picked** — pass `-UsbDriveLetter` (Windows) or `-UsbDevice` (Linux) explicitly. Don't trust auto-detect when you have multiple removable drives plugged in.
 - **A download fails** — the script keeps going and lists the failed ISOs at the end. Re-run with `-SkipVentoyInstall` to retry only the missing ones.
 - **Windows 11 LTSC** — Microsoft does not let scripts download it. The script prints the official MSDN-aggregator link and tells you where to drop the ISO afterwards.

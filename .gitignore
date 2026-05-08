@@ -28,6 +28,25 @@ persistence-*.dat
 *.tmp
 _*.ps1
 _*.sh
+_*.cmd
+preview-*.png
+preview-*.bmp
+test-*.bin
+test-*.png
+
+# ── Build outputs (Spventoy.exe IS committed; everything else compiled out) ─
+*.zip
+*.7z
+release-*/
+dist/
+build/
+out/
+
+# ── Runtime / temp ──────────────────────────────────────────────────────────
+*.iso.partial
+*.iso.part*
+spventoy_*.json
+nul
 
 # ── User-specific custom ISO list ───────────────────────────────────────────
 # Leave the example committed; ignore local overrides.

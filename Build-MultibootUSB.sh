@@ -244,7 +244,7 @@ declare -a ISO_CATALOG=()
 build_catalog() {
     local deb13g deb13k deb13x deb12g deb12s deb11g
     local ub24d ub24s ub22d ub22s ku24 xu24 lu24 mint_c mint_m mint_x
-    local rocky9 alma9 fedora arch kali_live kali_purple parrot tails
+    local rocky9 alma9 fedora arch kali_installer kali_purple parrot tails
     local proxmox truenas clonezilla gparted sysrescue memtest
 
     info "Building ISO catalog..."
@@ -261,7 +261,10 @@ build_catalog() {
     mint_x=$(resolve_linuxmint_urls xfce)
     rocky9=$(resolve_rocky_urls 9); alma9="https://repo.almalinux.org/almalinux/9/isos/x86_64/AlmaLinux-9-latest-x86_64-minimal.iso"
     fedora=$(resolve_fedora_urls); arch=$(resolve_arch_urls)
-    kali_live=$(resolve_kali_urls live-amd64); kali_purple=$(resolve_kali_urls installer-purple-amd64)
+    # Kali Live is torrent-only since 2025/2026 — kept as manual entry below.
+    # Installer variants are still served via HTTP.
+    kali_installer=$(resolve_kali_urls installer-amd64)
+    kali_purple=$(resolve_kali_urls installer-purple-amd64)
     parrot=$(resolve_parrot_urls); tails=$(resolve_tails_urls)
     proxmox=$(resolve_proxmox_urls); truenas=$(resolve_truenas_urls)
     clonezilla=$(resolve_clonezilla_urls); gparted=$(resolve_gparted_urls)
@@ -311,7 +314,8 @@ build_catalog() {
         "manjaro-kde-latest.iso|Manjaro - KDE Plasma|Linux/Arch|4000|https://download.manjaro.org/kde/latest/manjaro-kde-latest-x86_64.iso"
         "manjaro-gnome-latest.iso|Manjaro - GNOME|Linux/Arch|4000|https://download.manjaro.org/gnome/latest/manjaro-gnome-latest-x86_64.iso"
         # ── Security ────────────────────────────────────────────────────────
-        "kali-linux-live-amd64.iso|Kali Linux Live (latest)|Security|4000|${kali_live}"
+        "kali-linux-live-amd64.iso|Kali Linux Live (manual: torrent only)|Security|4000|MANUAL:https://www.kali.org/get-kali/"
+        "kali-linux-installer-amd64.iso|Kali Linux Installer (latest)|Security|3500|${kali_installer}"
         "kali-linux-installer-purple-amd64.iso|Kali Purple SOC (latest)|Security|4500|${kali_purple}"
         "Parrot-security-amd64.iso|Parrot Security OS (latest)|Security|3500|${parrot}"
         "tails-amd64.img|Tails (latest) - privacy/anon|Security|1500|${tails}"

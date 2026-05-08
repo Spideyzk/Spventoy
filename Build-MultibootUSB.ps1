@@ -77,7 +77,10 @@ param(
     [switch]$SkipVentoyInstall,
     [switch]$DirectToUSB,
     [switch]$UseCache,
-    [int]$PersistenceSizeMB = 8192
+    [int]$PersistenceSizeMB = 8192,
+    [switch]$NonInteractive,
+    [string[]]$SelectedIsoAliases,
+    [string]$LocalIsoPathsFile
 )
 
 if ($DirectToUSB -and $UseCache) {
@@ -176,6 +179,7 @@ $LANG = @{
         ModeCacheOk    = 'Mode: CACHE + COPY (downloads cached, then copied to USB)'
         DownloadingDirect = 'Downloading directly to USB...'
         WorkDirOk      = 'Work dir: {0}'
+        PressEnter     = 'Press ENTER to exit (USB is already ready)'
     }
     es = @{
         LangAsk        = 'Select language / Selecciona idioma [en/es, ENTER=en]: '
@@ -252,6 +256,7 @@ $LANG = @{
         ModeCacheOk   = 'Modo: CACHE + COPIA (descarga al cache y luego copia al USB)'
         DownloadingDirect = 'Descargando directo al USB...'
         WorkDirOk      = 'Directorio temporal: {0}'
+        PressEnter     = 'Pulsa ENTER para salir (la USB ya esta lista)'
     }
 }
 $L = $null  # set after language selection
@@ -294,6 +299,314 @@ function Format-Bytes([long]$b) {
     $u = @('B','KB','MB','GB','TB'); $i = 0; $s = [double]$b
     while ($s -ge 1024 -and $i -lt 4) { $s /= 1024; $i++ }
     "{0:N2} {1}" -f $s, $u[$i]
+}
+
+function Format-Eta {
+    param([long]$RemainingBytes, [double]$BytesPerSec)
+    if ($BytesPerSec -le 0 -or $RemainingBytes -le 0) { return '--:--' }
+    $secs = [int]($RemainingBytes / $BytesPerSec)
+    if ($secs -ge 3600) {
+        return ('{0:00}:{1:00}:{2:00}' -f ([int]($secs / 3600)), ([int](($secs % 3600) / 60)), ($secs % 60))
+    }
+    return ('{0:00}:{1:00}' -f ([int]($secs / 60)), ($secs % 60))
+}
+
+function Invoke-SegmentedDownload {
+    # Parallel multi-connection download via HTTP Range requests.
+    # Returns $true on success, $false if the server doesn't support ranges
+    # or the file is too small to benefit (caller should fall back to single-
+    # stream). Throws on hard failures.
+    param(
+        [Parameter(Mandatory)] [string]$Url,
+        [Parameter(Mandatory)] [string]$OutFile,
+        [int]$Segments   = 8,
+        [int]$TimeoutMin = 60
+    )
+
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+
+    # ── 1) HEAD: resolve redirects → final URL, get size + Accept-Ranges ──
+    $h = [System.Net.Http.HttpClientHandler]::new()
+    $h.AllowAutoRedirect        = $true
+    $h.MaxAutomaticRedirections = 10
+    try {
+        $tls = [System.Security.Authentication.SslProtocols]::Tls12
+        try { $tls = $tls -bor [System.Security.Authentication.SslProtocols]::Tls13 } catch {}
+        $h.SslProtocols = $tls
+    } catch {}
+    $hClient = [System.Net.Http.HttpClient]::new($h)
+    $hClient.Timeout = [TimeSpan]::FromMinutes(2)
+    $hClient.MaxResponseContentBufferSize = 17179869184L   # 16 GB
+    [void]$hClient.DefaultRequestHeaders.UserAgent.TryParseAdd('Spventoy/1.0')
+
+    $headReq  = [System.Net.Http.HttpRequestMessage]::new('HEAD', $Url)
+    $headResp = $hClient.SendAsync($headReq).GetAwaiter().GetResult()
+    if (-not $headResp.IsSuccessStatusCode) {
+        $hClient.Dispose()
+        throw ("HEAD failed: HTTP {0}" -f [int]$headResp.StatusCode)
+    }
+    $total        = [long]($headResp.Content.Headers.ContentLength)
+    $acceptRanges = ($headResp.Headers.AcceptRanges -join ',')
+    # Capture the final URL post-redirect — segments must hit it directly so the
+    # Range header isn't dropped by intermediate redirects.
+    $finalUrl = $headResp.RequestMessage.RequestUri.AbsoluteUri
+    $hClient.Dispose()
+
+    if ($total -le 0 -or $acceptRanges -notmatch 'bytes' -or $total -lt 8MB) {
+        return $false   # signal caller to use single-stream
+    }
+
+    # ── 2) Spawn N runspaces, each downloading a byte range to .partN ──────
+    $rsPool = [runspacefactory]::CreateRunspacePool(1, $Segments)
+    $rsPool.Open()
+
+    $segScript = {
+        param($url, $partFile, $from, $to)
+        Add-Type -AssemblyName System.Net.Http
+        $h = [System.Net.Http.HttpClientHandler]::new()
+        try {
+            $tls = [System.Security.Authentication.SslProtocols]::Tls12
+            try { $tls = $tls -bor [System.Security.Authentication.SslProtocols]::Tls13 } catch {}
+            $h.SslProtocols = $tls
+        } catch {}
+        # Don't auto-redirect — the parent already resolved the final URL, so
+        # any redirect here means something changed and we should fail loudly.
+        $h.AllowAutoRedirect = $false
+        $c = [System.Net.Http.HttpClient]::new($h)
+        $c.Timeout = [TimeSpan]::FromMinutes(60)
+        $c.MaxResponseContentBufferSize = 17179869184L   # 16 GB
+        [void]$c.DefaultRequestHeaders.UserAgent.TryParseAdd('Spventoy/1.0')
+        $rq = [System.Net.Http.HttpRequestMessage]::new('GET', $url)
+        $rq.Headers.Range = [System.Net.Http.Headers.RangeHeaderValue]::new([long]$from, [long]$to)
+        $rs = $c.SendAsync($rq, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        # Must be 206 Partial Content. If we got 200, the server ignored the
+        # Range header — abort so caller falls back to single-stream rather
+        # than downloading the whole file 8 times.
+        if ([int]$rs.StatusCode -ne 206) {
+            throw ("Range not honored: HTTP {0} (expected 206)" -f [int]$rs.StatusCode)
+        }
+        $st = $rs.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $fs = [System.IO.File]::Create($partFile)
+        $buf = New-Object byte[] 1048576   # 1 MB
+        try {
+            while (($n = $st.Read($buf, 0, $buf.Length)) -gt 0) {
+                $fs.Write($buf, 0, $n)
+            }
+        } finally {
+            $fs.Close(); $st.Close(); $c.Dispose()
+        }
+    }
+
+    $chunk = [long][Math]::Ceiling($total / [double]$Segments)
+    $jobs  = @()
+    for ($i = 0; $i -lt $Segments; $i++) {
+        $from = [long]$i * $chunk
+        $to   = [Math]::Min($from + $chunk - 1, $total - 1)
+        $part = "$OutFile.part$i"
+        if (Test-Path $part) { Remove-Item $part -Force -ErrorAction SilentlyContinue }
+        $ps = [PowerShell]::Create()
+        $ps.RunspacePool = $rsPool
+        [void]$ps.AddScript($segScript)
+        [void]$ps.AddArgument($finalUrl).AddArgument($part).AddArgument($from).AddArgument($to)
+        $jobs += [pscustomobject]@{
+            PS = $ps; Handle = $ps.BeginInvoke(); PartFile = $part
+        }
+    }
+
+    # ── 3) Progress loop with stall detection ──────────────────────────────
+    # If average rate over a 10s window stays under 500 KB/s for >20s of total
+    # stall time, abort segmented and let the caller fall back to single-stream.
+    $start     = [DateTime]::UtcNow
+    $lastTick  = $start
+    $lastBytes = 0L
+    $rateHist  = New-Object System.Collections.Generic.List[object]
+    $stallStart      = $null
+    $stallThreshold  = 512000   # 500 KB/s
+    $stallTriggerSec = 20
+    $startupGrace    = 6        # seconds before we start checking
+    $stalled         = $false
+    $width           = 100
+    try { $width = [Console]::WindowWidth } catch {}
+
+    while ($true) {
+        $allDone = $true
+        $sum = 0L
+        foreach ($j in $jobs) {
+            if (-not $j.Handle.IsCompleted) { $allDone = $false }
+            if (Test-Path $j.PartFile) { $sum += (Get-Item $j.PartFile).Length }
+        }
+
+        $now = [DateTime]::UtcNow
+        $sinceLast = ($now - $lastTick).TotalMilliseconds
+
+        # Maintain a rolling 10-second rate history
+        $rateHist.Add([pscustomobject]@{ Bytes = $sum; Time = $now })
+        while ($rateHist.Count -gt 1 -and ($now - $rateHist[0].Time).TotalSeconds -gt 10) {
+            $rateHist.RemoveAt(0)
+        }
+
+        if ($sinceLast -ge 500 -or $allDone) {
+            $instSpeed = if ($sinceLast -gt 0) { ($sum - $lastBytes) * 1000.0 / $sinceLast } else { 0 }
+            $pct = [Math]::Min(100, [Math]::Round(($sum / $total) * 100, 1))
+            $rem = [Math]::Max(0, $total - $sum)
+            $eta = Format-Eta -RemainingBytes $rem -BytesPerSec $instSpeed
+            $bw  = 24
+            $filled = [Math]::Min($bw, [int](($pct / 100) * $bw))
+            $bar = ('#' * $filled) + ('-' * ($bw - $filled))
+            $line = "     [$bar] $pct%  $(Format-Bytes $sum) / $(Format-Bytes $total)  $(Format-Bytes ([long]$instSpeed))/s  ETA $eta  (${Segments}x)"
+            Write-Host ("`r" + $line.PadRight([Math]::Max(40, $width - 1))) -NoNewline -ForegroundColor Cyan
+            $lastTick  = $now
+            $lastBytes = $sum
+        }
+
+        # Stall detection: rolling average over the last 10s
+        if (-not $allDone -and ($now - $start).TotalSeconds -gt $startupGrace -and $rateHist.Count -ge 2) {
+            $win = $rateHist[$rateHist.Count - 1].Bytes - $rateHist[0].Bytes
+            $sec = ($rateHist[$rateHist.Count - 1].Time - $rateHist[0].Time).TotalSeconds
+            $avgRate = if ($sec -gt 0) { $win / $sec } else { 0 }
+            if ($avgRate -lt $stallThreshold) {
+                if ($null -eq $stallStart) { $stallStart = $now }
+                elseif (($now - $stallStart).TotalSeconds -gt $stallTriggerSec) {
+                    $stalled = $true
+                    break
+                }
+            } else {
+                $stallStart = $null
+            }
+        }
+
+        if ($allDone) { break }
+        Start-Sleep -Milliseconds 250
+    }
+    Write-Host ''
+
+    if ($stalled) {
+        # Kill all in-flight runspaces and their part files, throw to caller
+        foreach ($j in $jobs) {
+            try { if (-not $j.Handle.IsCompleted) { [void]$j.PS.Stop() } } catch {}
+            try { $j.PS.Dispose() } catch {}
+            Remove-Item $j.PartFile -Force -ErrorAction SilentlyContinue
+        }
+        try { $rsPool.Close() } catch {}
+        try { $rsPool.Dispose() } catch {}
+        throw "Segmented download stalled (<500 KB/s for ${stallTriggerSec}s) — falling back to single stream"
+    }
+
+    # ── 4) Collect errors ───────────────────────────────────────────────────
+    $errors = @()
+    foreach ($j in $jobs) {
+        try { [void]$j.PS.EndInvoke($j.Handle) } catch { $errors += $_.Exception.Message }
+        if ($j.PS.Streams.Error.Count -gt 0) {
+            $errors += ($j.PS.Streams.Error | ForEach-Object { $_.ToString() })
+        }
+        $j.PS.Dispose()
+    }
+    $rsPool.Close()
+    $rsPool.Dispose()
+
+    if ($errors.Count -gt 0) {
+        foreach ($j in $jobs) { Remove-Item $j.PartFile -Force -ErrorAction SilentlyContinue }
+        throw ("Segmented download failed: " + ($errors -join '; '))
+    }
+
+    # ── 5) Concat parts → final file ────────────────────────────────────────
+    $outFs = [System.IO.File]::Create($OutFile)
+    try {
+        foreach ($j in $jobs) {
+            $pf = [System.IO.File]::OpenRead($j.PartFile)
+            $pf.CopyTo($outFs)
+            $pf.Close()
+            Remove-Item $j.PartFile -Force -ErrorAction SilentlyContinue
+        }
+    } finally {
+        $outFs.Close()
+    }
+
+    return $true
+}
+
+function Invoke-StreamDownload {
+    # Streamed HTTP download with inline progress (percentage, speed, ETA).
+    param(
+        [Parameter(Mandatory)] [string]$Url,
+        [Parameter(Mandatory)] [string]$OutFile,
+        [int]$TimeoutMin = 60
+    )
+
+    Add-Type -AssemblyName System.Net.Http -ErrorAction SilentlyContinue
+
+    $handler = [System.Net.Http.HttpClientHandler]::new()
+    $handler.AllowAutoRedirect        = $true
+    $handler.MaxAutomaticRedirections = 10
+    # Force TLS 1.2/1.3 — without this, PS 5.1 / older .NET Framework defaults
+    # may negotiate down and fail on modern HTTPS endpoints.
+    try {
+        $tls = [System.Security.Authentication.SslProtocols]::Tls12
+        try { $tls = $tls -bor [System.Security.Authentication.SslProtocols]::Tls13 } catch {}
+        $handler.SslProtocols = $tls
+    } catch {}
+    $client = [System.Net.Http.HttpClient]::new($handler)
+    $client.Timeout = [TimeSpan]::FromMinutes($TimeoutMin)
+    $client.MaxResponseContentBufferSize = 17179869184L   # 16 GB — handle ISOs > 2 GB
+    [void]$client.DefaultRequestHeaders.UserAgent.TryParseAdd('Spventoy/1.0')
+
+    $fs = $null
+    try {
+        $resp = $client.GetAsync($Url, [System.Net.Http.HttpCompletionOption]::ResponseHeadersRead).GetAwaiter().GetResult()
+        if (-not $resp.IsSuccessStatusCode) {
+            throw "HTTP $([int]$resp.StatusCode) $($resp.ReasonPhrase)"
+        }
+        $total  = $resp.Content.Headers.ContentLength
+        $stream = $resp.Content.ReadAsStreamAsync().GetAwaiter().GetResult()
+        $fs     = [System.IO.File]::Create($OutFile)
+
+        $buf       = New-Object byte[] 1048576   # 1 MB chunks
+        $bytesRead = 0L
+        $start     = [DateTime]::UtcNow
+        $lastTick  = $start
+        $lastBytes = 0L
+
+        $width = 100
+        try { $width = [Console]::WindowWidth } catch {}
+
+        while (($n = $stream.Read($buf, 0, $buf.Length)) -gt 0) {
+            $fs.Write($buf, 0, $n)
+            $bytesRead += $n
+
+            $now = [DateTime]::UtcNow
+            $sinceLast = ($now - $lastTick).TotalMilliseconds
+            if ($sinceLast -ge 500) {
+                $instSpeed = if ($sinceLast -gt 0) { ($bytesRead - $lastBytes) * 1000.0 / $sinceLast } else { 0 }
+
+                $line = if ($total -and $total -gt 0) {
+                    $pct = [Math]::Min(100, [Math]::Round(($bytesRead / $total) * 100, 1))
+                    $rem = $total - $bytesRead
+                    $eta = Format-Eta -RemainingBytes $rem -BytesPerSec $instSpeed
+                    $bw  = 24
+                    $filled = [Math]::Min($bw, [int](($pct / 100) * $bw))
+                    $bar = ('#' * $filled) + ('-' * ($bw - $filled))
+                    "     [$bar] $pct%  $(Format-Bytes $bytesRead) / $(Format-Bytes $total)  $(Format-Bytes ([long]$instSpeed))/s  ETA $eta"
+                } else {
+                    "     $(Format-Bytes $bytesRead) downloaded  $(Format-Bytes ([long]$instSpeed))/s"
+                }
+
+                Write-Host ("`r" + $line.PadRight([Math]::Max(40, $width - 1))) -NoNewline -ForegroundColor Cyan
+                $lastTick  = $now
+                $lastBytes = $bytesRead
+            }
+        }
+
+        $fs.Close(); $fs = $null
+        Write-Host ''   # finalize progress line
+        return $true
+    } catch {
+        if ($fs) { try { $fs.Close() } catch {} }
+        if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+        Write-Host ''
+        throw
+    } finally {
+        if ($client) { $client.Dispose() }
+    }
 }
 
 function Test-Admin {
@@ -355,20 +668,17 @@ function Invoke-DownloadMulti {
                     Write-Warn2 "HEAD failed: $($_.Exception.Message). Next URL."; break
                 }
 
-                $got = $false
-                if (Get-Module -ListAvailable -Name BitsTransfer) {
-                    Import-Module BitsTransfer -ErrorAction SilentlyContinue
-                    try {
-                        Start-BitsTransfer -Source $url -Destination $tmp `
-                            -DisplayName (Split-Path $OutFile -Leaf) -ErrorAction Stop
-                        $got = $true
-                    } catch {
-                        Write-Info "BITS failed, switching to WebRequest..."
-                        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                $usedSegmented = $false
+                try {
+                    if (Invoke-SegmentedDownload -Url $url -OutFile $tmp -Segments 8) {
+                        $usedSegmented = $true
                     }
+                } catch {
+                    Write-Info "Segmented failed ($($_.Exception.Message)), retrying with single stream..."
+                    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
                 }
-                if (-not $got) {
-                    Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing -ErrorAction Stop
+                if (-not $usedSegmented) {
+                    Invoke-StreamDownload -Url $url -OutFile $tmp -ErrorAction Stop
                 }
 
                 if ((Test-Path $tmp) -and (Get-Item $tmp).Length -gt $MinBytes) {
@@ -989,8 +1299,14 @@ function Get-IsoCatalog {
            Alias='openSUSE Tumbleweed (rolling)';   SizeMB=4500; Urls=(Resolve-OpenSuseUrls 'tumbleweed') }
 
         # ------------------------------------------------------------------ Security / Privacy
+        # NOTE: Kali stopped publishing the Live ISO via direct HTTP — it's now
+        # torrent-only on cdimage.kali.org. The installer variants are still
+        # served via HTTP, so we offer those automatically and Live as manual.
         @{ Folder='Security'; Name='kali-linux-live-amd64.iso';
-           Alias='Kali Linux Live (latest)';        SizeMB=4000; Urls=(Resolve-KaliUrls 'live-amd64') }
+           Alias='Kali Linux Live (manual: torrent only)'; SizeMB=4000; Manual=$true;
+           ManualUrl='https://www.kali.org/get-kali/  (download Live image via torrent)' }
+        @{ Folder='Security'; Name='kali-linux-installer-amd64.iso';
+           Alias='Kali Linux Installer (latest)';   SizeMB=3500; Urls=(Resolve-KaliUrls 'installer-amd64') }
         @{ Folder='Security'; Name='kali-linux-installer-purple-amd64.iso';
            Alias='Kali Purple SOC (latest)';        SizeMB=4000; Urls=(Resolve-KaliUrls 'installer-purple-amd64') }
         @{ Folder='Security'; Name='Parrot-security-amd64.iso';
@@ -1634,23 +1950,24 @@ function Get-ThemeTxtContent {
     param([string]$title)
     return @"
 title-text: ""
+desktop-image: "background.png"
 desktop-color: "#0a0612"
 terminal-font: "Unifont Regular 16"
 
 + boot_menu {
     left = 5%
-    top = 18%
+    top = 32%
     width = 60%
-    height = 65%
+    height = 55%
     item_font = "Unifont Regular 16"
-    item_color = "#e9d5ff"
+    item_color = "#c4b5fd"
     selected_item_color = "#ffffff"
-    icon_width = 32
-    icon_height = 32
-    item_icon_space = 14
-    item_height = 36
-    item_padding = 4
-    item_spacing = 2
+    icon_width = 48
+    icon_height = 48
+    item_icon_space = 18
+    item_height = 52
+    item_padding = 6
+    item_spacing = 4
 }
 
 + label {
@@ -1662,7 +1979,152 @@ terminal-font: "Unifont Regular 16"
     text = "$title  ::  ^v Navigate  ::  Enter Boot  ::  F5 Tools"
     font = "Unifont Regular 12"
 }
+
++ label {
+    top = 95%
+    left = 5%
+    width = 90%
+    align = "right"
+    color = "#7c3aed"
+    text = "Spventoy"
+    font = "Unifont Regular 12"
+}
 "@
+}
+
+function New-IconPlaceholder {
+    # Generate a 128x128 PNG with a colored circle and the first letter of the
+    # icon name. Used when a bundled icon for a given key is not available.
+    param(
+        [Parameter(Mandatory)] [string]$OutPath,
+        [Parameter(Mandatory)] [string]$Letter,
+        [string]$BgHex = '#7c3aed'
+    )
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+
+    $size = 128
+    $bmp  = [System.Drawing.Bitmap]::new($size, $size)
+    $g    = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode     = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+
+    $r  = [Convert]::ToInt32($BgHex.Substring(1, 2), 16)
+    $gC = [Convert]::ToInt32($BgHex.Substring(3, 2), 16)
+    $b  = [Convert]::ToInt32($BgHex.Substring(5, 2), 16)
+    $bg = [System.Drawing.Color]::FromArgb($r, $gC, $b)
+
+    $bgBrush = [System.Drawing.SolidBrush]::new($bg)
+    $g.FillEllipse($bgBrush, 4, 4, $size - 8, $size - 8)
+    $bgBrush.Dispose()
+
+    $font = [System.Drawing.Font]::new('Arial', [single]64, [System.Drawing.FontStyle]::Bold)
+    $sf   = [System.Drawing.StringFormat]::new()
+    $sf.Alignment     = [System.Drawing.StringAlignment]::Center
+    $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+    $txtBrush = [System.Drawing.SolidBrush]::new([System.Drawing.Color]::White)
+    $rect = [System.Drawing.RectangleF]::new([single]0, [single]0, [single]$size, [single]$size)
+    $g.DrawString($Letter.ToUpper().Substring(0, 1), $font, $txtBrush, $rect, $sf)
+    $txtBrush.Dispose()
+    $font.Dispose()
+    $g.Dispose()
+
+    $outDir = Split-Path -Parent $OutPath
+    if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+    $bmp.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
+}
+
+function New-VentoyBackground {
+    param(
+        [Parameter(Mandatory)] [string]$OutPath,
+        [Parameter(Mandatory)] [string]$Title,
+        [int]$Width  = 1920,
+        [int]$Height = 1080
+    )
+
+    Add-Type -AssemblyName System.Drawing -ErrorAction Stop
+
+    $bmp = [System.Drawing.Bitmap]::new($Width, $Height)
+    $g   = [System.Drawing.Graphics]::FromImage($bmp)
+    $g.SmoothingMode     = [System.Drawing.Drawing2D.SmoothingMode]::AntiAlias
+    $g.TextRenderingHint = [System.Drawing.Text.TextRenderingHint]::AntiAliasGridFit
+
+    # Vertical gradient: dark purple top → near-black bottom
+    $top  = [System.Drawing.Color]::FromArgb(30, 10, 60)
+    $bot  = [System.Drawing.Color]::FromArgb(10,  6, 18)
+    $rect = [System.Drawing.Rectangle]::new(0, 0, $Width, $Height)
+    $brush = [System.Drawing.Drawing2D.LinearGradientBrush]::new(
+        $rect, $top, $bot, [System.Drawing.Drawing2D.LinearGradientMode]::Vertical)
+    $g.FillRectangle($brush, $rect)
+    $brush.Dispose()
+
+    # Subtle accent glow band behind the title
+    $glow      = [System.Drawing.Color]::FromArgb(40, 124, 58, 237)
+    $glowBrush = [System.Drawing.SolidBrush]::new($glow)
+    $glowRect  = [System.Drawing.Rectangle]::new(0, [int]($Height * 0.04), $Width, 280)
+    $g.FillRectangle($glowBrush, $glowRect)
+    $glowBrush.Dispose()
+
+    # Title text (USB title, big & centered)
+    $tt = $Title.ToUpper()
+    $sf = [System.Drawing.StringFormat]::new()
+    $sf.Alignment     = [System.Drawing.StringAlignment]::Center
+    $sf.LineAlignment = [System.Drawing.StringAlignment]::Center
+
+    # Fall back through fonts so we always render something
+    $fontName = $null
+    foreach ($candidate in @('Segoe UI Variable','Segoe UI','Arial','Verdana')) {
+        try {
+            $probe = [System.Drawing.Font]::new($candidate, [single]80, [System.Drawing.FontStyle]::Bold)
+            $fontName = $candidate
+            $probe.Dispose()
+            break
+        } catch {}
+    }
+    if (-not $fontName) { $fontName = 'Arial' }
+
+    $titleFont = [System.Drawing.Font]::new($fontName, [single]92, [System.Drawing.FontStyle]::Bold)
+    $subFont   = [System.Drawing.Font]::new($fontName, [single]18, [System.Drawing.FontStyle]::Regular)
+
+    $titleY    = [single]($Height * 0.06)
+    $titleRect = [System.Drawing.RectangleF]::new([single]0, $titleY, [single]$Width, [single]160)
+
+    # Drop-shadow / glow pass (offset 4 px down-right, semi-transparent purple)
+    $shadow      = [System.Drawing.Color]::FromArgb(180, 124, 58, 237)
+    $shadowBrush = [System.Drawing.SolidBrush]::new($shadow)
+    $shadowRect  = [System.Drawing.RectangleF]::new([single]4, ($titleY + 4), [single]$Width, [single]160)
+    $g.DrawString($tt, $titleFont, $shadowBrush, $shadowRect, $sf)
+    $shadowBrush.Dispose()
+
+    # Main title
+    $titleColor = [System.Drawing.Color]::FromArgb(233, 213, 255)
+    $titleBrush = [System.Drawing.SolidBrush]::new($titleColor)
+    $g.DrawString($tt, $titleFont, $titleBrush, $titleRect, $sf)
+    $titleBrush.Dispose()
+
+    # Decorative line beneath the title
+    $lineY   = [int]($titleY + 175)
+    $lineLen = 720
+    $lineX1  = [int](($Width - $lineLen) / 2)
+    $linePen = [System.Drawing.Pen]::new([System.Drawing.Color]::FromArgb(124, 58, 237), [single]2.0)
+    $g.DrawLine($linePen, $lineX1, $lineY, $lineX1 + $lineLen, $lineY)
+    $linePen.Dispose()
+
+    # Subtitle
+    $subColor = [System.Drawing.Color]::FromArgb(167, 139, 250)
+    $subBrush = [System.Drawing.SolidBrush]::new($subColor)
+    $subRect  = [System.Drawing.RectangleF]::new([single]0, [single]($lineY + 14), [single]$Width, [single]36)
+    $g.DrawString('M U L T I B O O T   U S B   B U I L D E R', $subFont, $subBrush, $subRect, $sf)
+    $subBrush.Dispose()
+
+    $titleFont.Dispose()
+    $subFont.Dispose()
+    $g.Dispose()
+
+    $outDir = Split-Path -Parent $OutPath
+    if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+    $bmp.Save($OutPath, [System.Drawing.Imaging.ImageFormat]::Png)
+    $bmp.Dispose()
 }
 
 # ============================================================================
@@ -1672,14 +2134,18 @@ Write-Banner
 
 if (-not (Test-Admin)) {
     Write-Err "Run as Administrator / Ejecuta como Administrador."
-    Read-Host "ENTER"
+    Read-Host "Press ENTER to exit / Pulsa ENTER para salir"
     exit 1
 }
 
 # --- Language ---
 if ([string]::IsNullOrWhiteSpace($Language)) {
-    $inp = Read-Host ($LANG.en.LangAsk)
-    $Language = if ($inp.Trim() -in @('es','ES')) { 'es' } else { 'en' }
+    if ($NonInteractive) {
+        $Language = 'en'
+    } else {
+        $inp = Read-Host ($LANG.en.LangAsk)
+        $Language = if ($inp.Trim() -in @('es','ES')) { 'es' } else { 'en' }
+    }
 }
 $L = $LANG[$Language.ToLower()]
 if (-not $L) { $L = $LANG.en }
@@ -1687,10 +2153,14 @@ $script:L = $L
 
 # --- Title ---
 if ([string]::IsNullOrWhiteSpace($Title)) {
-    Write-Host ""
-    Write-Host ("  {0}" -f $L.TitleAsk) -ForegroundColor Cyan
-    $inp  = Read-Host ($L.TitleRead)
-    $Title = if ([string]::IsNullOrWhiteSpace($inp)) { 'MYBOOT' } else { $inp.Trim() }
+    if ($NonInteractive) {
+        $Title = 'MYBOOT'
+    } else {
+        Write-Host ""
+        Write-Host ("  {0}" -f $L.TitleAsk) -ForegroundColor Cyan
+        $inp  = Read-Host ($L.TitleRead)
+        $Title = if ([string]::IsNullOrWhiteSpace($inp)) { 'MYBOOT' } else { $inp.Trim() }
+    }
 }
 $script:Title = $Title
 $themeSlug = ($Title -replace '[^a-zA-Z0-9_-]', '_').ToLower()
@@ -1700,6 +2170,8 @@ if ($DirectToUSB) {
     $script:UseDirectMode = $true
 } elseif ($UseCache) {
     $script:UseDirectMode = $false
+} elseif ($NonInteractive) {
+    $script:UseDirectMode = $true   # default to direct in non-interactive mode
 } else {
     Write-Host ""
     Write-Host ("  " + $L.ModeAsk) -ForegroundColor Cyan
@@ -1727,7 +2199,7 @@ if ([string]::IsNullOrWhiteSpace($DownloadDir)) {
 }
 
 # --- Persistence ---
-if (-not $SkipPersistence.IsPresent) {
+if (-not $SkipPersistence.IsPresent -and -not $NonInteractive) {
     Write-Host ""
     Write-Host ("  " + $L.PersistAsk) -ForegroundColor Cyan -NoNewline
     $inp = Read-Host
@@ -1767,17 +2239,56 @@ try {
     }
 } catch {
     Write-Err "Cannot create $DownloadDir : $($_.Exception.Message)"
-    Read-Host "ENTER"; exit 1
+    Read-Host $L.PressEnter; exit 1
 }
 
 # --- Resolve latest versions & build catalog ---
 Write-Step $L.Resolving
 $catalog = @(Get-IsoCatalog) + @(Get-CustomIsos)
 
+# --- Local ISO paths (use already-downloaded files instead of re-downloading) ---
+if ($LocalIsoPathsFile -and (Test-Path $LocalIsoPathsFile)) {
+    try {
+        $localObj = Get-Content -Raw $LocalIsoPathsFile | ConvertFrom-Json
+        $localMap = @{}
+        foreach ($p in $localObj.PSObject.Properties) { $localMap[$p.Name] = [string]$p.Value }
+        $applied = 0
+        foreach ($iso in $catalog) {
+            if ($localMap.ContainsKey($iso.Alias)) {
+                $path = $localMap[$iso.Alias]
+                if (Test-Path $path) {
+                    $iso.LocalPath = $path
+                    $applied++
+                } else {
+                    Write-Warn2 "Local file for '$($iso.Alias)' not found: $path"
+                }
+            }
+        }
+        if ($applied -gt 0) { Write-Ok "$applied ISO(s) mapped to local files (no download needed)" }
+    } catch {
+        Write-Warn2 "Could not read LocalIsoPathsFile: $($_.Exception.Message)"
+    }
+}
+
 # --- ISO selection ---
-$menuResult  = Show-IsoMenu -Catalog $catalog
-$sel         = $menuResult.Sel
-$catalog     = $menuResult.Catalog   # may include custom ISOs added interactively
+if ($NonInteractive -or ($SelectedIsoAliases -and $SelectedIsoAliases.Count -gt 0)) {
+    # Skip interactive menu — pre-select by alias
+    $aliasSet = @{}
+    foreach ($a in $SelectedIsoAliases) { $aliasSet[$a.Trim()] = $true }
+    $sel = [System.Collections.Generic.List[bool]]::new()
+    foreach ($iso in $catalog) {
+        [void]$sel.Add([bool]$aliasSet[$iso.Alias])
+    }
+    if ($SelectedIsoAliases) {
+        Write-Ok ("Pre-selected $($SelectedIsoAliases.Count) ISO(s) from -SelectedIsoAliases")
+    } else {
+        Write-Warn2 "Non-interactive mode but no -SelectedIsoAliases provided. Nothing will be downloaded."
+    }
+} else {
+    $menuResult = Show-IsoMenu -Catalog $catalog
+    $sel        = $menuResult.Sel
+    $catalog    = $menuResult.Catalog   # may include custom ISOs added interactively
+}
 
 $selectedIsos = @()
 for ($ii = 0; $ii -lt $catalog.Count; $ii++) {
@@ -1853,8 +2364,14 @@ if (-not $SkipVentoyInstall) {
             Write-Err $L.VentoyMissing
         } else {
             Write-Ok "Found: $exe"
-            $inp = Read-Host $L.VentoyOpen
-            if ($inp.Trim() -in @('n','N','no','No','NO')) {
+            $skipOpen = $false
+            if ($NonInteractive) {
+                Write-Info "Auto-opening Ventoy2Disk (non-interactive mode)"
+            } else {
+                $inp = Read-Host $L.VentoyOpen
+                if ($inp.Trim() -in @('n','N','no','No','NO')) { $skipOpen = $true }
+            }
+            if ($skipOpen) {
                 Write-Info "Skipping Ventoy installer (already installed?)"
             } else {
                 try { Start-Process -FilePath $exe -Wait; Write-Ok "Done" }
@@ -1923,13 +2440,13 @@ if ($onLinux -or $onMac) {
                     @{N='Size';E={Format-Bytes $_.Size}},
                     @{N='Free';E={Format-Bytes $_.SizeRemaining}}
             $ltr = Read-Host $L.UsbPrompt
-            if ([string]::IsNullOrWhiteSpace($ltr)) { Write-Err "Aborted."; Read-Host "ENTER"; exit 1 }
+            if ([string]::IsNullOrWhiteSpace($ltr)) { Write-Err "Aborted."; Read-Host $L.PressEnter; exit 1 }
             $usbRoot = $ltr.TrimEnd(':') + ':'
         }
     }
 }
 if (-not (Test-Path $usbRoot)) {
-    Write-Err ($L.UsbNoAccess -f $usbRoot); Read-Host "ENTER"; exit 1
+    Write-Err ($L.UsbNoAccess -f $usbRoot); Read-Host $L.PressEnter; exit 1
 }
 
 $usbFreeGB = Get-DriveFreeGB $usbRoot
@@ -1966,6 +2483,10 @@ foreach ($iso in $catalog) {
             Write-Warn2 $L.LtscNote
             Write-Info  $L.LtscUrl
             Write-Info  ($L.LtscDest -f $usbRoot)
+        } elseif ($iso.ManualUrl) {
+            Write-Warn2 "Manual download required. Get it from:"
+            Write-Info  "  $($iso.ManualUrl)"
+            Write-Info  "  Then place the ISO in: $dest\$($iso.Name)"
         } else {
             Write-Warn2 ($L.ManualMsg -f $dest)
         }
@@ -1984,6 +2505,32 @@ foreach ($iso in $catalog) {
     $destDir  = Join-Path $usbRoot ('ISO\' + $iso.Folder)
     if (-not (Test-Path $destDir)) { New-Item -ItemType Directory -Path $destDir -Force | Out-Null }
     $destPath = Join-Path $destDir $iso.Name
+
+    # ── Local file shortcut: copy and skip download ───────────────────────
+    if ($iso.LocalPath -and (Test-Path $iso.LocalPath)) {
+        Write-Info "Using local file: $($iso.LocalPath)"
+        try {
+            $srcResolved  = (Resolve-Path -LiteralPath $iso.LocalPath).Path
+            $destResolved = if (Test-Path $destPath) { (Resolve-Path -LiteralPath $destPath).Path } else { $destPath }
+            if ($srcResolved -ieq $destResolved) {
+                Write-Info $L.AlreadyUsb
+            } else {
+                $srcSize = (Get-Item $iso.LocalPath).Length
+                if ((Test-Path $destPath) -and (Get-Item $destPath).Length -eq $srcSize) {
+                    Write-Info $L.AlreadyUsb
+                } else {
+                    Write-Info $L.Copying
+                    Copy-Item $iso.LocalPath $destPath -Force -ErrorAction Stop
+                    Write-Ok ("Copied from local ($(Format-Bytes $srcSize))")
+                }
+            }
+            $results += [PSCustomObject]@{ ISO=$iso.Alias; Status='OK'; Note='local' }
+        } catch {
+            Write-Err "Copy from local failed: $($_.Exception.Message)"
+            $results += [PSCustomObject]@{ ISO=$iso.Alias; Status='COPY_FAIL'; Note=$_.Exception.Message }
+        }
+        continue
+    }
 
     # Where the download lands. Direct-to-USB unless the ISO needs unzipping
     # (zips need a temp extraction area, so they always go through cache first).
@@ -2049,31 +2596,35 @@ Write-Step $L.Step5
 $iconsDir = Join-Path $usbRoot "ventoy\theme\$themeSlug\icons"
 if (-not (Test-Path $iconsDir)) { New-Item -ItemType Directory -Path $iconsDir -Force | Out-Null }
 
+# Bundled icons live next to the script. Placeholders are generated for any
+# key that doesn't have a bundled PNG. No network calls in this step.
+$bundledDir = Join-Path $PSScriptRoot 'icons'
+
 foreach ($name in $IconSources.Keys) {
     $out = Join-Path $iconsDir "$name.png"
     if ((Test-Path $out) -and (Get-Item $out).Length -gt 1KB) {
         Write-Info "$name  already exists"
         continue
     }
-    $saved = $false
-    foreach ($url in $IconSources[$name]) {
+
+    $bundled = Join-Path $bundledDir "$name.png"
+    if (Test-Path $bundled) {
         try {
-            $tmp = "$out.tmp"
-            Invoke-WebRequest -Uri $url -OutFile $tmp -UseBasicParsing `
-                -TimeoutSec 20 -MaximumRedirection 5 -ErrorAction Stop
-            # Validate: must be a real image (PNG/JPEG magic bytes or >2KB)
-            if ((Test-Path $tmp) -and (Get-Item $tmp).Length -gt 2KB) {
-                Move-Item $tmp $out -Force
-                Write-Ok "$name"
-                $saved = $true
-                break
-            }
-            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+            Copy-Item $bundled $out -Force -ErrorAction Stop
+            Write-Ok "$name"
+            continue
         } catch {
-            Remove-Item "$out.tmp" -Force -ErrorAction SilentlyContinue
+            Write-Warn2 "$name copy failed: $($_.Exception.Message)"
         }
     }
-    if (-not $saved) { Write-Warn2 "$name  all sources failed" }
+
+    # No bundled icon — synthesize a placeholder
+    try {
+        New-IconPlaceholder -OutPath $out -Letter $name
+        Write-Info "$name (placeholder)"
+    } catch {
+        Write-Warn2 "$name skipped: $($_.Exception.Message)"
+    }
 }
 
 # Derived icons (copies)
@@ -2098,6 +2649,16 @@ try {
         Set-Content (Join-Path $usbRoot 'ventoy\ventoy.json') -Encoding UTF8
     Get-ThemeTxtContent -title $Title |
         Set-Content (Join-Path $usbRoot "ventoy\theme\$themeSlug\theme.txt") -Encoding UTF8
+
+    # Generate the background image (gradient + title banner)
+    try {
+        $bgPath = Join-Path $usbRoot "ventoy\theme\$themeSlug\background.png"
+        New-VentoyBackground -OutPath $bgPath -Title $Title
+        Write-Info "Background image generated"
+    } catch {
+        Write-Warn2 "Background image failed (theme will fall back to solid color): $($_.Exception.Message)"
+    }
+
     Write-Ok $L.CfgOk
 } catch { Write-Err "Config error: $($_.Exception.Message)" }
 
@@ -2163,4 +2724,4 @@ try {
 Write-Ok ($L.DoneMsg -f $Title, $usbRoot)
 Write-Info ($L.ManualWin -f $usbRoot)
 Write-Host ""
-Read-Host "ENTER"
+Read-Host $L.PressEnter
