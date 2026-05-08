@@ -62,6 +62,8 @@ $STRINGS = @{
         BtnClearLocal  = 'Clear local file'
         LocalSet       = '[local]'
         TipUseLocal    = 'Use a local ISO file instead of downloading. Click to pick / change. Right-click to clear.'
+        LblCacheDir    = 'Cache directory'
+        BtnBrowseDir   = 'Browse...'
         SelectedSummary= '{0} selected, ~{1} GB'
         BtnStart       = 'Start build'
         BtnStop        = 'Stop'
@@ -118,6 +120,8 @@ $STRINGS = @{
         BtnClearLocal  = 'Borrar archivo local'
         LocalSet       = '[local]'
         TipUseLocal    = 'Usar un archivo ISO local en lugar de descargar. Click para elegir / cambiar. Click derecho para borrar.'
+        LblCacheDir    = 'Directorio del cache'
+        BtnBrowseDir   = 'Examinar...'
         SelectedSummary= '{0} seleccionadas, ~{1} GB'
         BtnStart       = 'Empezar'
         BtnStop        = 'Parar'
@@ -400,7 +404,22 @@ $xamlText = @'
                         <RadioButton x:Name="RdoDirect" GroupName="mode" IsChecked="True"
                                      Content="Direct to USB" Margin="0,2"/>
                         <RadioButton x:Name="RdoCache"  GroupName="mode"
-                                     Content="Cache + copy" Margin="0,2,0,12"/>
+                                     Content="Cache + copy" Margin="0,2,0,4"/>
+
+                        <!-- Cache directory (visible only when Cache mode is selected) -->
+                        <StackPanel x:Name="PnlCacheDir" Visibility="Collapsed" Margin="20,0,0,12">
+                            <TextBlock x:Name="LblCacheDir" Text="Cache directory" Margin="0,0,0,3"
+                                       FontSize="11" Foreground="{StaticResource TxtDim}"/>
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="*"/>
+                                    <ColumnDefinition Width="Auto"/>
+                                </Grid.ColumnDefinitions>
+                                <TextBox x:Name="TxtCacheDir" Grid.Column="0"/>
+                                <Button  x:Name="BtnBrowseCacheDir" Grid.Column="1" Content="..."
+                                         Margin="6,0,0,0" Padding="10,4"/>
+                            </Grid>
+                        </StackPanel>
 
                         <TextBlock x:Name="LblDrive" Text="USB drive" Margin="0,0,0,3"/>
                         <Grid Margin="0,0,0,4">
@@ -532,6 +551,10 @@ $txtTitle       = Find 'TxtTitle'
 $lblMode        = Find 'LblMode'
 $rdoDirect      = Find 'RdoDirect'
 $rdoCache       = Find 'RdoCache'
+$pnlCacheDir    = Find 'PnlCacheDir'
+$lblCacheDir    = Find 'LblCacheDir'
+$txtCacheDir    = Find 'TxtCacheDir'
+$btnBrowseCacheDir = Find 'BtnBrowseCacheDir'
 $lblDrive       = Find 'LblDrive'
 $cmbDrive       = Find 'CmbDrive'
 $btnRefresh     = Find 'BtnRefresh'
@@ -920,6 +943,8 @@ function Apply-Lang {
     $btnAll.Content     = L 'BtnAll'
     $btnNone.Content    = L 'BtnNone'
     $btnInstallVentoy.Content = L 'BtnInstallVentoy'
+    $lblCacheDir.Text         = L 'LblCacheDir'
+    $btnBrowseCacheDir.Content = '...'
     Update-VentoyStatus
     $btnStart.Content   = L 'BtnStart'
     $btnStop.Content    = L 'BtnStop'
@@ -1159,7 +1184,13 @@ function Start-Build {
         '-UsbDriveLetter', $drive,
         '-SelectedIsoAliasesFile', $aliasFile
     )
-    if ($rdoDirect.IsChecked) { $argList += '-DirectToUSB' } else { $argList += '-UseCache' }
+    if ($rdoDirect.IsChecked) {
+        $argList += '-DirectToUSB'
+    } else {
+        $argList += '-UseCache'
+        $cacheDir = $txtCacheDir.Text.Trim()
+        if ($cacheDir) { $argList += @('-DownloadDir', $cacheDir) }
+    }
     if (-not $chkPersist.IsChecked) { $argList += '-SkipPersistence' }
     # If Ventoy is already on the selected drive, skip the install step entirely
     if (Test-VentoyOnDrive $drive) { $argList += '-SkipVentoyInstall' }
@@ -1283,6 +1314,32 @@ $btnStop.Add_Click({ Stop-Build })
 
 $chkPersist.Add_Checked({   $gridPersist.IsEnabled = $true })
 $chkPersist.Add_Unchecked({ $gridPersist.IsEnabled = $false })
+
+# Toggle the cache-dir UI when the user picks Cache mode. Also seed the field
+# with a sensible default the first time it's shown.
+$rdoCache.Add_Checked({
+    $pnlCacheDir.Visibility = 'Visible'
+    if ([string]::IsNullOrWhiteSpace($txtCacheDir.Text)) {
+        $title = $txtTitle.Text.Trim()
+        if (-not $title) { $title = 'MYBOOT' }
+        $txtCacheDir.Text = Join-Path $env:USERPROFILE "${title}_cache"
+    }
+})
+$rdoDirect.Add_Checked({ $pnlCacheDir.Visibility = 'Collapsed' })
+
+$btnBrowseCacheDir.Add_Click({
+    Add-Type -AssemblyName System.Windows.Forms -ErrorAction SilentlyContinue
+    $fbd = New-Object System.Windows.Forms.FolderBrowserDialog
+    $fbd.Description = 'Select cache directory for ISO downloads'
+    if ($txtCacheDir.Text -and (Test-Path $txtCacheDir.Text -ErrorAction SilentlyContinue)) {
+        $fbd.SelectedPath = $txtCacheDir.Text
+    } else {
+        $fbd.SelectedPath = $env:USERPROFILE
+    }
+    if ($fbd.ShowDialog() -eq [System.Windows.Forms.DialogResult]::OK) {
+        $txtCacheDir.Text = $fbd.SelectedPath
+    }
+})
 
 function Switch-Language([string]$lang) {
     # Preserve check state across the rebuild

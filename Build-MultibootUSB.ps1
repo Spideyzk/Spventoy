@@ -643,12 +643,211 @@ function Get-DriveFreeGB([string]$path) {
 # ============================================================================
 # DOWNLOAD ENGINE
 # ============================================================================
+function Get-Aria2cExe {
+    # Cached lookup. Returns full path or $null.
+    if ($script:Aria2cPath -ne $null) { return $script:Aria2cPath }
+    $cmd = Get-Command 'aria2c.exe' -ErrorAction SilentlyContinue
+    if (-not $cmd) { $cmd = Get-Command 'aria2c' -ErrorAction SilentlyContinue }
+    if ($cmd) { $script:Aria2cPath = $cmd.Source; return $script:Aria2cPath }
+    # Try common install locations
+    $candidates = @(
+        "$env:USERPROFILE\scoop\shims\aria2c.exe",
+        "$env:USERPROFILE\scoop\apps\aria2\current\aria2c.exe",
+        "$env:ProgramFiles\aria2\aria2c.exe",
+        "${env:ProgramFiles(x86)}\aria2\aria2c.exe"
+    )
+    foreach ($c in $candidates) {
+        if (Test-Path $c) { $script:Aria2cPath = $c; return $c }
+    }
+    # WinGet path glob
+    try {
+        $wingetMatches = Get-ChildItem "$env:LOCALAPPDATA\Microsoft\WinGet\Packages\aria2.aria2_*\*\aria2c.exe" -ErrorAction SilentlyContinue
+        if ($wingetMatches) { $script:Aria2cPath = $wingetMatches[0].FullName; return $script:Aria2cPath }
+    } catch {}
+    $script:Aria2cPath = ''   # cache "not found"
+    return $null
+}
+
+function Get-CurlExe {
+    if ($script:CurlPath -ne $null) { return $script:CurlPath }
+    # Windows 10+ ships curl.exe in System32
+    $sys = Join-Path $env:SystemRoot 'System32\curl.exe'
+    if (Test-Path $sys) { $script:CurlPath = $sys; return $sys }
+    $cmd = Get-Command 'curl.exe' -ErrorAction SilentlyContinue
+    if ($cmd) { $script:CurlPath = $cmd.Source; return $script:CurlPath }
+    $script:CurlPath = ''
+    return $null
+}
+
+function Invoke-Aria2cDownload {
+    # Multi-connection download via aria2c. Returns $true on success.
+    param([string]$Url, [string]$OutFile, [int]$Connections = 16)
+
+    $aria2 = Get-Aria2cExe
+    if (-not $aria2) { return $false }
+
+    $outDir  = Split-Path -Parent $OutFile
+    $outName = Split-Path -Leaf $OutFile
+    if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+
+    $aria2Args = @(
+        "-x", "$Connections",
+        "-s", "$Connections",
+        "-k", "1M",
+        "--allow-overwrite=true",
+        "--auto-file-renaming=false",
+        "--file-allocation=none",
+        "--summary-interval=0",
+        "--quiet=true",
+        "--max-tries=2",
+        "--retry-wait=2",
+        "--connect-timeout=30",
+        "--user-agent=Spventoy/1.0",
+        "-d", $outDir,
+        "-o", $outName,
+        $Url
+    )
+
+    # Get expected total size via HEAD so we can show a real percentage.
+    # If HEAD doesn't return Content-Length (some servers omit it), try a
+    # tiny ranged GET (bytes=0-0) which usually returns Content-Range with
+    # the full file size.
+    $expectedSize = 0L
+    try {
+        $resp = Invoke-WebRequest -Uri $Url -Method Head -UseBasicParsing -TimeoutSec 15 -MaximumRedirection 10
+        $cl = $resp.Headers.'Content-Length'
+        if ($cl) { $expectedSize = [long]$cl }
+    } catch {}
+    if ($expectedSize -le 0) {
+        try {
+            $req = [System.Net.HttpWebRequest]::Create($Url)
+            $req.Method = 'GET'
+            $req.AddRange(0, 0)
+            $req.AllowAutoRedirect = $true
+            $req.Timeout = 15000
+            $req.UserAgent = 'Spventoy/1.0'
+            $r2 = $req.GetResponse()
+            $cr = $r2.Headers['Content-Range']    # e.g., "bytes 0-0/12345678"
+            $r2.Close()
+            if ($cr -match '/\s*(\d+)\s*$') { $expectedSize = [long]$Matches[1] }
+        } catch {}
+    }
+
+    Write-Info "aria2c -x $Connections -s $Connections ..."
+
+    # Clean any leftover partial file so we don't read stale bytes as progress
+    if (Test-Path $OutFile) { Remove-Item $OutFile -Force -ErrorAction SilentlyContinue }
+    $aria2CtlFile = "$OutFile.aria2"
+    if (Test-Path $aria2CtlFile) { Remove-Item $aria2CtlFile -Force -ErrorAction SilentlyContinue }
+
+    # Start-Process requires distinct files for stdout/stderr; use separate ones
+    $guid = [Guid]::NewGuid().ToString('N')
+    $aria2OutLog = Join-Path $env:TEMP "aria2_${guid}.out.log"
+    $aria2ErrLog = Join-Path $env:TEMP "aria2_${guid}.err.log"
+    $proc = $null
+    try {
+        $proc = Start-Process -FilePath $aria2 -ArgumentList $aria2Args `
+            -NoNewWindow -PassThru `
+            -RedirectStandardOutput $aria2OutLog -RedirectStandardError $aria2ErrLog
+    } catch {
+        Write-Warn2 "Failed to start aria2c: $($_.Exception.Message)"
+        Remove-Item $aria2OutLog,$aria2ErrLog -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+    if (-not $proc) {
+        Write-Warn2 "aria2c did not start (Start-Process returned null)"
+        Remove-Item $aria2OutLog,$aria2ErrLog -Force -ErrorAction SilentlyContinue
+        return $false
+    }
+
+    # Poll the output file size and print our own progress line — uniform with
+    # the segmented downloader's output regardless of which engine is in use.
+    $start     = [DateTime]::UtcNow
+    $lastTick  = $start
+    $lastBytes = 0L
+    $width = 100
+    try { $width = [Console]::WindowWidth } catch {}
+
+    while (-not $proc.HasExited) {
+        Start-Sleep -Milliseconds 500
+        $sz = 0L
+        if (Test-Path $OutFile) {
+            try { $sz = (Get-Item -LiteralPath $OutFile -ErrorAction SilentlyContinue).Length } catch {}
+        }
+        $now = [DateTime]::UtcNow
+        $sinceLast = ($now - $lastTick).TotalMilliseconds
+        if ($sinceLast -ge 500) {
+            $instSpeed = if ($sinceLast -gt 0) { ($sz - $lastBytes) * 1000.0 / $sinceLast } else { 0 }
+            $line = if ($expectedSize -gt 0) {
+                $pct = [Math]::Min(100, [Math]::Round(($sz / $expectedSize) * 100, 1))
+                $rem = [Math]::Max(0, $expectedSize - $sz)
+                $eta = Format-Eta -RemainingBytes $rem -BytesPerSec $instSpeed
+                $bw  = 24
+                $filled = [Math]::Min($bw, [int](($pct / 100) * $bw))
+                $bar = ('#' * $filled) + ('-' * ($bw - $filled))
+                "     [$bar] $pct%  $(Format-Bytes $sz) / $(Format-Bytes $expectedSize)  $(Format-Bytes ([long]$instSpeed))/s  ETA $eta  (aria2c ${Connections}x)"
+            } else {
+                "     $(Format-Bytes $sz) downloaded  $(Format-Bytes ([long]$instSpeed))/s  (aria2c ${Connections}x)"
+            }
+            Write-Host ("`r" + $line.PadRight([Math]::Max(40, $width - 1))) -NoNewline -ForegroundColor Cyan
+            $lastTick  = $now
+            $lastBytes = $sz
+        }
+    }
+    Write-Host ''
+
+    # Surface aria2c errors if exit code != 0
+    $exitCode = $proc.ExitCode
+    if ($exitCode -ne 0) {
+        $errLines = @()
+        foreach ($f in @($aria2ErrLog, $aria2OutLog)) {
+            if (Test-Path $f) {
+                $lines = Get-Content $f -ErrorAction SilentlyContinue | Where-Object { $_ -and $_.Trim() }
+                if ($lines) { $errLines += ($lines | Select-Object -Last 3) }
+            }
+        }
+        if ($errLines) { Write-Warn2 ("aria2c exit $exitCode. Last output: " + ($errLines -join ' | ')) }
+        else           { Write-Warn2 "aria2c exit $exitCode (no output)" }
+    }
+    Remove-Item $aria2OutLog,$aria2ErrLog -Force -ErrorAction SilentlyContinue
+
+    return ($exitCode -eq 0)
+}
+
+function Invoke-CurlDownload {
+    # Single-stream HTTP download via curl. Reliable but no parallelism.
+    param([string]$Url, [string]$OutFile)
+
+    $curl = Get-CurlExe
+    if (-not $curl) { return $false }
+
+    $outDir = Split-Path -Parent $OutFile
+    if (-not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
+
+    $curlArgs = @(
+        "-L",
+        "--fail",
+        "--retry", "2",
+        "--retry-delay", "2",
+        "--connect-timeout", "30",
+        "--progress-bar",
+        "-A", "Spventoy/1.0",
+        "-o", $OutFile,
+        $Url
+    )
+    Write-Info "curl --progress-bar ..."
+    & $curl @curlArgs
+    return ($LASTEXITCODE -eq 0)
+}
+
 function Invoke-DownloadMulti {
     param(
         [string[]]$Urls,
         [string]$OutFile,
         [int]$Retries   = 2,
-        [long]$MinBytes = 5MB
+        [long]$MinBytes = 64KB     # MemTest86+ zip is only ~235 KB; HTML
+                                    # error pages are typically <50 KB so
+                                    # 64 KB is the safe sweet spot
     )
 
     if (Test-Path $OutFile) {
@@ -682,16 +881,51 @@ function Invoke-DownloadMulti {
                     Write-Warn2 "HEAD failed: $($_.Exception.Message). Next URL."; break
                 }
 
-                $usedSegmented = $false
-                try {
-                    if (Invoke-SegmentedDownload -Url $url -OutFile $tmp -Segments 8) {
-                        $usedSegmented = $true
+                # Tiered download:
+                #   1) aria2c (multi-conn, fastest) — if installed
+                #   2) PowerShell segmented (multi-conn, no deps) — if Range supported
+                #   3) curl (single-stream, reliable, no PS buffer issues) — Win10+
+                #   4) PowerShell HttpClient stream — last resort
+                $downloaded = $false
+
+                if (-not $downloaded) {
+                    if (Get-Aria2cExe) {
+                        try {
+                            if (Invoke-Aria2cDownload -Url $url -OutFile $tmp -Connections 16) {
+                                $downloaded = $true
+                            }
+                        } catch {
+                            Write-Info "aria2c failed ($($_.Exception.Message))"
+                            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                        }
                     }
-                } catch {
-                    Write-Info "Segmented failed ($($_.Exception.Message)), retrying with single stream..."
-                    Remove-Item $tmp -Force -ErrorAction SilentlyContinue
                 }
-                if (-not $usedSegmented) {
+
+                if (-not $downloaded) {
+                    try {
+                        if (Invoke-SegmentedDownload -Url $url -OutFile $tmp -Segments 8) {
+                            $downloaded = $true
+                        }
+                    } catch {
+                        Write-Info "Segmented failed ($($_.Exception.Message))"
+                        Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                    }
+                }
+
+                if (-not $downloaded) {
+                    if (Get-CurlExe) {
+                        try {
+                            if (Invoke-CurlDownload -Url $url -OutFile $tmp) {
+                                $downloaded = $true
+                            }
+                        } catch {
+                            Write-Info "curl failed ($($_.Exception.Message))"
+                            Remove-Item $tmp -Force -ErrorAction SilentlyContinue
+                        }
+                    }
+                }
+
+                if (-not $downloaded) {
                     Invoke-StreamDownload -Url $url -OutFile $tmp -ErrorAction Stop
                 }
 
@@ -1439,12 +1673,14 @@ function Test-UrlsAliveParallel {
                 if ($r) {
                     $c = [int]$r.StatusCode
                     $r.Close()
-                    # 405 = HEAD not allowed but URL exists; 416 = range issue;
-                    # both signal a live endpoint.
-                    return ($c -eq 405 -or $c -eq 416 -or ($c -ge 200 -and $c -lt 400))
+                    # Treat as alive UNLESS the URL is clearly gone:
+                    # 404/410 = not found / gone. Other 4xx/5xx might be
+                    # CDN HEAD blocks (Cloudflare often returns 403 to HEAD)
+                    # — give them a chance and let the actual download try.
+                    return ($c -ne 404 -and $c -ne 410)
                 }
             } catch {}
-            return $false
+            return $false   # network error, DNS, timeout
         } catch { return $false }
     }
 
@@ -2024,7 +2260,7 @@ function Get-VentoyJsonContent {
     return @"
 {
   "control": [
-    { "VTOY_DEFAULT_MENU_MODE": "0" },
+    { "VTOY_DEFAULT_MENU_MODE": "1" },
     { "VTOY_TREE_VIEW_MENU_STYLE": "0" },
     { "VTOY_FILT_DOT_UNDERSCORE_FILE": "1" },
     { "VTOY_SORT_CASE_SENSITIVE": "0" },
@@ -2107,22 +2343,12 @@ terminal-font: "Unifont Regular 16"
 }
 
 + label {
-    top = 95%
+    top = 90%
     left = 5%
     width = 90%
-    align = "left"
+    align = "center"
     color = "#a78bfa"
-    text = "$title  ::  ^v Navigate  ::  Enter Boot  ::  F5 Tools"
-    font = "Unifont Regular 12"
-}
-
-+ label {
-    top = 95%
-    left = 5%
-    width = 90%
-    align = "right"
-    color = "#7c3aed"
-    text = "Spventoy"
+    text = "^v Navigate    Enter Boot    F5 Tools    Esc Power"
     font = "Unifont Regular 12"
 }
 "@
@@ -2327,10 +2553,15 @@ if ([string]::IsNullOrWhiteSpace($DownloadDir)) {
         $DownloadDir = Join-Path $tempBase "spventoy_$themeSlug"
     } else {
         $defaultDir = if ($onLinux -or $onMac) { "$HOME/${Title}_cache" } else { "$env:USERPROFILE\${Title}_cache" }
-        Write-Host ""
-        Write-Host ("  " + ($L.DirAsk -f 40)) -ForegroundColor Cyan
-        $inp        = Read-Host ($L.DirRead -f $defaultDir)
-        $DownloadDir = if ([string]::IsNullOrWhiteSpace($inp)) { $defaultDir } else { $inp.Trim() }
+        if ($NonInteractive) {
+            $DownloadDir = $defaultDir
+            Write-Info "Cache directory (auto, non-interactive): $DownloadDir"
+        } else {
+            Write-Host ""
+            Write-Host ("  " + ($L.DirAsk -f 40)) -ForegroundColor Cyan
+            $inp        = Read-Host ($L.DirRead -f $defaultDir)
+            $DownloadDir = if ([string]::IsNullOrWhiteSpace($inp)) { $defaultDir } else { $inp.Trim() }
+        }
     }
 }
 
@@ -2377,6 +2608,17 @@ try {
     Write-Err "Cannot create $DownloadDir : $($_.Exception.Message)"
     if (-not $NonInteractive) { Read-Host $L.PressEnter }
     exit 1
+}
+
+# --- Report download engine availability ---
+$dlEngines = @()
+if (Get-Aria2cExe)  { $dlEngines += "aria2c (16x parallel)" } else { $dlEngines += "aria2c [NOT installed]" }
+$dlEngines += "PowerShell segmented (8x)"
+if (Get-CurlExe)    { $dlEngines += "curl" }
+$dlEngines += "PowerShell stream"
+Write-Info ("Download engines (in order): " + ($dlEngines -join " -> "))
+if (-not (Get-Aria2cExe)) {
+    Write-Info "  Tip: 'winget install aria2.aria2' for the fastest downloads"
 }
 
 # --- Resolve latest versions & build catalog ---
@@ -2746,12 +2988,29 @@ if (-not (Test-Path $iconsDir)) { New-Item -ItemType Directory -Path $iconsDir -
 # key that doesn't have a bundled PNG. No network calls in this step.
 $bundledDir = Join-Path $PSScriptRoot 'icons'
 
+function Test-IsRealPng([string]$path) {
+    if (-not (Test-Path $path)) { return $false }
+    try {
+        if ((Get-Item $path).Length -lt 100) { return $false }
+        $fs = [System.IO.File]::OpenRead($path)
+        try {
+            $buf = New-Object byte[] 8
+            [void]$fs.Read($buf, 0, 8)
+            # PNG signature: 89 50 4E 47 0D 0A 1A 0A
+            return ($buf[0] -eq 0x89 -and $buf[1] -eq 0x50 -and $buf[2] -eq 0x4E -and $buf[3] -eq 0x47)
+        } finally { $fs.Close() }
+    } catch { return $false }
+}
+
 foreach ($name in $IconSources.Keys) {
     $out = Join-Path $iconsDir "$name.png"
-    if ((Test-Path $out) -and (Get-Item $out).Length -gt 1KB) {
+    if (Test-IsRealPng $out) {
         Write-Info "$name  already exists"
         continue
     }
+    # If file exists but isn't a real PNG (e.g., HTML error page from a
+    # previous run), delete it so we regenerate clean
+    if (Test-Path $out) { Remove-Item $out -Force -ErrorAction SilentlyContinue }
 
     $bundled = Join-Path $bundledDir "$name.png"
     if (Test-Path $bundled) {
